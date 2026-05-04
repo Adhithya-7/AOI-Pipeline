@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+ENV/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Deep Learning / YOLO
+runs/
+*.pt
+*.onnx
+*.engine
+*.pth
+
+# App Data / Configurations
+.ois_data/
+modular_aoi/.real_compare_home/
+modular_aoi/.workflow_compare_home/
+config.json
+
+# Ignore large datasets (optional, uncomment if you don't want to push images)
+# data/
+# test_defects/generated_defects_v3/
