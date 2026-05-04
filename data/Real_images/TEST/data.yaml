@@ -1,5 +1,0 @@
-path: D:/MELSS/AOI/NEW_TEST_IMGS/TEST
-train: images
-val: images
-nc: 25
-names: ['Connector (P)', 'Resistor (R)', 'Transformer (T)', 'Diode (D)', 'Capacitor (C)', 'Transistor (Q)', 'Jumper (J)', 'Inductor (L)', 'IC (U)', 'Resistor Array (RA)', 'Resistor Net (RN)', 'Crystal (CR)', 'IC (IC)', 'Jumper (JP)', 'Varistor (V)', 'Button (BTN)', 'Switch (SW)', 'Switch (S)', 'Test Point (TP)', 'LED', 'Transistor (QA)', 'Cap Array (CRA)', 'Motor (M)', 'Fuse (F)', 'Ferrite Bead (FB)']
