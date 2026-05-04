@@ -112,7 +112,7 @@ pip install ultralytics opencv-python numpy PySide6 Pillow scipy pyyaml platform
 
 ### Model weights
 
-All scripts expect a YOLOv8 model at `models/best.pt` relative to the repository root. This file is not included in the repository. Either train your own model using the `train/` scripts or place a pre-trained `.pt` file there.
+All scripts expect a YOLO model at `models/best.pt` relative to the repository root. This file is included in the repository. If requiredtochange either train your own model using the `train/` scripts or place a pre-trained `.pt` file there.
 
 ---
 
