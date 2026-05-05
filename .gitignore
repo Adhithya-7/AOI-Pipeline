@@ -33,12 +33,6 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Deep Learning / YOLO
-runs/
-*.pt
-*.onnx
-*.engine
-*.pth
 
 # App Data / Configurations
 .ois_data/
