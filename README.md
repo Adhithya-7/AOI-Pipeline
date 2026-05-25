@@ -35,6 +35,26 @@ The 25 supported component classes are: Connector (P), Resistor (R), Transformer
 
 ---
 
+## Misalignment & Defect Detection System (v3.9)
+
+The OIS inspection engine features a highly robust, multi-signal alignment and defect classification system (v3.9) designed to maximize inspection accuracy and runtime efficiency:
+
+- **Two-Pass NCC Rotation Recovery (`_aoi_misalignment_check`)**:
+  - **Coarse Pass**: Sweeps from `-45°` to `+45°` in `5°` increments using normalized cross-correlation (NCC) to find the approximate rotation.
+  - **Fine Pass**: Sweeps in `1°` increments within a `±8°` window around the coarse candidate to recover exact component misalignment.
+  - Gated to run only when an active YOLO component detection exists at the slot, ensuring zero redundant computational overhead.
+- **Gradient Orientation Histogram (GOH) Polarity Check (`_aoi_goh_polarity`)**:
+  - Compares the gradient angle distribution (12 bins over `[-pi, pi]`) of the golden and test crops.
+  - Detects 180° polarity marker flips with extreme reliability.
+  - Includes a secondary fallback utilizing an **Intensity Asymmetry Opposition Score** to resolve subtle or low-contrast polar markings.
+- **Canny Edge Density Rescue (`_aoi_edge_density`)**:
+  - Measures structural pixel content in high-variance or low-contrast slots.
+  - Prevents false-positive "missing" classifications by rescuing wrong-component defects.
+- **Clear Defect Visualization**:
+  - Misaligned defects are drawn with a distinct **Yellow** BGR bounding box `(0, 255, 255)` overlay to clearly distinguish them from missing (red) or incorrect (orange/blue) components.
+
+---
+
 ## Repository Structure
 
 ```
@@ -206,9 +226,9 @@ python src/generate_defect.py \
 
 #### **`aoi_evaluator.py`**
 
-Automated accuracy evaluator (v3.6). Injects defects into a golden board using the same injection logic as `generate_defect.py`, then immediately runs the AOI inspection algorithms on each synthetic board and reports precision, recall, F1, and a confusion matrix. No GUI. Designed for regression testing of the detection thresholds.
+Automated accuracy evaluator (v3.9). Injects defects into a golden board using the same injection logic as `generate_defect.py`, then immediately runs the AOI inspection algorithms (including two-pass NCC rotation, GOH polarity, and edge-density rescues) on each synthetic board and reports precision, recall, F1, and a confusion matrix. No GUI. Designed for regression testing and threshold verification.
 
-The evaluation pipeline is self-contained: it detects golden components, injects defects, runs the full multi-signal classification (SSIM, template matching, NCC polarity, patch variance), and records whether each injected defect was correctly identified.
+The evaluation pipeline is self-contained: it detects golden components, injects defects, runs the full multi-signal classification (SSIM, template matching, GOH polarity, two-pass misalignment check, edge density rescue, and patch variance), and records whether each injected defect was correctly identified.
 
 **Input:** A golden board image and a YOLO model path.
 
@@ -521,7 +541,7 @@ Not a runnable script; imported by `aoi_engine.py`, `threads.py`, and several ta
 
 #### **`aoi_engine.py`**
 
-Core AOI inspection algorithms. Contains all detection and comparison logic: `_aoi_bbox_overlap`, `_aoi_nms_by_centre`, `_aoi_infer_arr` (YOLO/SAHI inference returning `_AOIComp` lists), `_aoi_hungarian_match`, `_aoi_region_diff`, `_aoi_calibrate`, `_aoi_ncc_polarity` (NCC-based polarity flip detection), `_aoi_patch_ssim`, `_aoi_patch_variance`, `_aoi_patch_tmpl`, `_aoi_same_det_is_local`, `_aoi_check_board` (the main slot-level defect classifier), `render_overlay`, and `OfflineAOIThread` (a `QThread` wrapping `_aoi_check_board` for the AOI tab).
+Core AOI inspection algorithms. Contains all detection and comparison logic: `_aoi_bbox_overlap`, `_aoi_nms_by_centre`, `_aoi_infer_arr` (YOLO/SAHI inference returning `_AOIComp` lists), `_aoi_hungarian_match`, `_aoi_region_diff`, `_aoi_calibrate`, `_aoi_ncc_polarity`, `_aoi_misalignment_check` (two-pass coarse/fine rotation recovery), `_aoi_goh_polarity` (Gradient Orientation Histogram), `_aoi_intensity_asymmetry_score`, `_aoi_edge_density` (Canny edge rescue), `_aoi_patch_ssim`, `_aoi_patch_variance`, `_aoi_patch_tmpl`, `_aoi_same_det_is_local`, `_aoi_check_board` (the main slot-level defect classifier), `render_overlay`, and `OfflineAOIThread` (a `QThread` wrapping `_aoi_check_board` for the AOI tab).
 
 The slot-classification thresholds in this module were validated on 100-board evaluator runs and mirror those in `aoi_evaluator.py` exactly.
 
