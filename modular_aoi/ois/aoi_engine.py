@@ -61,6 +61,24 @@ _AOI_CROSS_RESCUE_TMPL  = 0.20  # cross_polar_rescue tmpl floor:          WCOM d
 _AOI_CROSS_RESCUE_NCC   = 0.50  # cross_polar_rescue NCC delta floor:     FP had delta=0.401, TP ≥ 0.708
 _AOI_SSIM_CROSS_MAX     = 0.45  # cross_polar_rescue SSIM upper bound:    WCOM caps score ssim > 0.45
 
+# v3.9: Two-pass misalignment sweep (ported from evaluator v3.9 Fix P)
+_MISALIGN_RECOVER_NCC_MIN    = 0.60   # min recovered NCC to accept misalignment
+_MISALIGN_RECOVER_GAIN_MIN   = 0.06   # min NCC improvement over 0 deg baseline
+_MISALIGN_RECOVER_ANGLE_MIN  = 10.0   # min angle (degrees) to classify as misaligned
+_MISALIGN_FINE_WINDOW        = 8      # +/-8 deg around coarse best for fine pass
+_MISALIGN_FINE_STEP          = 1      # 1 deg resolution in fine pass
+
+# v3.9 Fix N: Gradient Orientation Histogram polarity
+_GOH_POLAR_BINS          = 12      # 30 deg bins over [-pi, pi]
+_GOH_POLAR_MIN_DELTA     = 0.08    # gap: WCOM max ~0.06, WPOL min ~0.15
+_GOH_ASYM_VOTE_BAND_LO  = 0.05    # uncertain band lower bound
+_GOH_ASYM_VOTE_BAND_HI  = 0.10    # uncertain band upper bound
+_ASYM_POLAR_MIN          = 0.025   # minimum opposition score for asym vote
+
+# v3.9 Fix O: Edge-density rescue
+_EDGE_DENSITY_WC_MIN     = 0.045   # Gaussian fill: 0.00-0.01; donor: 0.04-0.18
+
+
 _AOI_COMPATIBLE = {
     ("misaligned","missing"),    ("missing","misaligned"),
     ("wrong_component","missing"),("missing","wrong_component"),
@@ -73,7 +91,7 @@ _AOI_COMPATIBLE = {
 _DEFECT_COLOURS = {  # BGR
     "ok":              (  0,200,  0),
     "missing":         (  0,  0,255),
-    "misaligned":      (  0,165,255),
+    "misaligned":      (  0,255,255),
     "wrong_component": (255,  0,255),
     "wrong_polarity":  (255,128,  0),
     "ghost":           ( 50, 50, 50),
@@ -346,6 +364,167 @@ def _aoi_same_det_is_local(dc, gc, golden_by_label: dict) -> bool:
     return True
 
 
+
+
+# -- v3.9 Fix P: Two-pass misalignment check (ported from evaluator v3.9) -----
+def _aoi_misalignment_check(golden_img, test_img, gc, W: int, H: int) -> tuple:
+    """Two-pass rotation recovery for misalignment detection (v3.9).
+
+    Pass 1 (coarse): 5 deg steps over [-45, +45].
+    Pass 2 (fine):   1 deg steps over [coarse_best +/- 8 deg].
+
+    Returns (is_misaligned: bool, best_angle: float, reason_str: str)
+    """
+    if not HAS_CV2 or not HAS_NP:
+        return False, 0.0, "no_cv2"
+    hw = gc.w * 0.45; hh = gc.h * 0.45
+    x1 = max(0, int((gc.cx - hw) * W)); y1 = max(0, int((gc.cy - hh) * H))
+    x2 = min(W, int((gc.cx + hw) * W)); y2 = min(H, int((gc.cy + hh) * H))
+    ph, pw = y2 - y1, x2 - x1
+    if pw < 10 or ph < 10:
+        return False, 0.0, "patch_too_small"
+
+    g_gray = cv2.cvtColor(golden_img[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    t_gray = cv2.cvtColor(test_img  [y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    center = (pw // 2, ph // 2)
+
+    def _recover_ncc(angle):
+        if angle == 0:
+            return float(cv2.matchTemplate(t_gray, g_gray,
+                                           cv2.TM_CCOEFF_NORMED)[0][0])
+        M     = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rot_t = cv2.warpAffine(t_gray, M, (pw, ph),
+                               flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REPLICATE)
+        return float(cv2.matchTemplate(rot_t, g_gray,
+                                       cv2.TM_CCOEFF_NORMED)[0][0])
+
+    # -- Pass 1: coarse 5 deg sweep
+    coarse_best_ncc   = -1.0
+    coarse_best_angle = 0
+    for angle in range(-45, 50, 5):
+        if angle == 0:
+            continue
+        ncc = _recover_ncc(angle)
+        if ncc > coarse_best_ncc:
+            coarse_best_ncc   = ncc
+            coarse_best_angle = angle
+
+    # -- Pass 2: fine 1 deg sweep around coarse best
+    fine_best_ncc   = coarse_best_ncc
+    fine_best_angle = coarse_best_angle
+    fine_lo = coarse_best_angle - _MISALIGN_FINE_WINDOW
+    fine_hi = coarse_best_angle + _MISALIGN_FINE_WINDOW + 1
+    for angle in range(fine_lo, fine_hi, _MISALIGN_FINE_STEP):
+        if angle == 0 or angle == coarse_best_angle:
+            continue
+        ncc = _recover_ncc(angle)
+        if ncc > fine_best_ncc:
+            fine_best_ncc   = ncc
+            fine_best_angle = angle
+
+    best_ncc     = fine_best_ncc
+    best_angle   = fine_best_angle
+    unrot_ncc    = _recover_ncc(0)
+    recover_gain = best_ncc - unrot_ncc
+
+    reason = (f"recov_ncc={best_ncc:.2f} gain={recover_gain:.2f} "
+              f"(base={unrot_ncc:.2f}) at {best_angle} deg")
+
+    if (best_ncc   >= _MISALIGN_RECOVER_NCC_MIN
+            and recover_gain >= _MISALIGN_RECOVER_GAIN_MIN
+            and abs(best_angle) >= _MISALIGN_RECOVER_ANGLE_MIN):
+        return True, float(best_angle), (
+            f"rotation_recovered ncc={best_ncc:.2f} "
+            f"gain={recover_gain:.2f} at {best_angle} deg"
+        )
+
+    return False, float(best_angle), reason
+
+
+# -- v3.9 Fix N: Gradient Orientation Histogram polarity -----------------------
+def _aoi_goh_polarity(golden_img, test_img, gc, W: int, H: int) -> tuple:
+    """Gradient Orientation Histogram (GOH) polarity check.
+    Returns (is_flipped: bool, goh_delta: float)
+    """
+    if not HAS_CV2 or not HAS_NP:
+        return False, 0.0
+    hw = gc.w * 0.35; hh = gc.h * 0.35
+    x1 = max(0, int((gc.cx - hw) * W)); y1 = max(0, int((gc.cy - hh) * H))
+    x2 = min(W, int((gc.cx + hw) * W)); y2 = min(H, int((gc.cy + hh) * H))
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return False, 0.0
+
+    def _build_goh(img_bgr, _y1, _y2, _x1, _x2):
+        gray  = cv2.cvtColor(img_bgr[_y1:_y2, _x1:_x2], cv2.COLOR_BGR2GRAY)
+        blur  = cv2.GaussianBlur(gray.astype(np.float32), (3, 3), 0)
+        gx    = cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3)
+        gy    = cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3)
+        mag   = np.sqrt(gx ** 2 + gy ** 2)
+        ang   = np.arctan2(gy, gx)
+        hist, _ = np.histogram(ang, bins=_GOH_POLAR_BINS,
+                               range=(-_math.pi, _math.pi), weights=mag)
+        total = hist.sum()
+        return hist / (total + 1e-6)
+
+    g_hist = _build_goh(golden_img, y1, y2, x1, x2)
+    t_hist = _build_goh(test_img,   y1, y2, x1, x2)
+    half = _GOH_POLAR_BINS // 2
+    g_hist_rot = np.roll(g_hist, half)
+
+    def _ncc_hist(a, b):
+        a = a - a.mean(); b = b - b.mean()
+        denom = np.linalg.norm(a) * np.linalg.norm(b)
+        return float(np.dot(a, b) / denom) if denom > 1e-6 else 0.0
+
+    corr_orig = _ncc_hist(g_hist, t_hist)
+    corr_rot  = _ncc_hist(g_hist_rot, t_hist)
+    goh_delta = corr_rot - corr_orig
+    return goh_delta >= _GOH_POLAR_MIN_DELTA, goh_delta
+
+
+# -- v3.9 Fix N (tie-breaker): Intensity asymmetry opposition score ------------
+def _aoi_intensity_asymmetry_score(golden_img, test_img, gc,
+                                    W: int, H: int) -> float:
+    """Intensity asymmetry opposition score. Returns float in [-1, 1]."""
+    if not HAS_CV2 or not HAS_NP:
+        return 0.0
+    hw = gc.w * 0.28; hh = gc.h * 0.28
+    x1 = max(0, int((gc.cx - hw) * W)); y1 = max(0, int((gc.cy - hh) * H))
+    x2 = min(W, int((gc.cx + hw) * W)); y2 = min(H, int((gc.cy + hh) * H))
+    if x2 - x1 < 6 or y2 - y1 < 6:
+        return 0.0
+    def _bias(img_bgr, _y1, _y2, _x1, _x2):
+        gray = cv2.cvtColor(img_bgr[_y1:_y2, _x1:_x2],
+                            cv2.COLOR_BGR2GRAY).astype(np.float32)
+        h, w = gray.shape
+        mh, mw = h // 2, w // 2
+        top = float(gray[:mh, :].mean()); bot = float(gray[mh:, :].mean())
+        lft = float(gray[:, :mw].mean()); rgt = float(gray[:, mw:].mean())
+        tb  = (top - bot) / (top + bot + 1e-6)
+        lr  = (lft - rgt) / (lft + rgt + 1e-6)
+        return tb, lr
+    g_tb, g_lr = _bias(golden_img, y1, y2, x1, x2)
+    t_tb, t_lr = _bias(test_img,   y1, y2, x1, x2)
+    return float((-g_tb * t_tb + -g_lr * t_lr) / 2.0)
+
+
+# -- v3.9 Fix O: Edge density (wrong_component rescue from missing path) ------
+def _aoi_edge_density(img, gc, W: int, H: int) -> float:
+    """Canny edge density within component crop (v3.9 Fix O)."""
+    if not HAS_CV2 or not HAS_NP:
+        return 0.0
+    hw = gc.w * 0.32; hh = gc.h * 0.32
+    x1 = max(0, int((gc.cx - hw) * W)); y1 = max(0, int((gc.cy - hh) * H))
+    x2 = min(W, int((gc.cx + hw) * W)); y2 = min(H, int((gc.cy + hh) * H))
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return 0.0
+    patch = cv2.cvtColor(img[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    blur  = cv2.GaussianBlur(patch, (3, 3), 0)
+    edges = cv2.Canny(blur, 20, 60)
+    return float(np.count_nonzero(edges)) / (edges.size + 1e-6)
+
+
 def _aoi_check_board(golden: list, golden_img, test_img, dets: list,
                      pos_tol: float, per_thr: dict,
                      polarity_mult: float = 1.5,
@@ -506,6 +685,23 @@ def _aoi_check_board(golden: list, golden_img, test_img, dets: list,
 
         # ── ZONE B: moderate change — let detection evidence decide ───────────
         if region_diff < high_thr:
+            # v3.9: rotation rescue -- check for misalignment before same-det logic
+            _zb_mali_ok = False
+            if same_dets:
+                _zb_mali_ok, _zb_mali_angle, _zb_mali_reason = _aoi_misalignment_check(
+                    golden_img, test_img, gc, W, H)
+            if _zb_mali_ok:
+                _mali_fl = (same_dets[0][1].label if same_dets else
+                           (cross_dets[0][1].label if cross_dets else gc.label))
+                defects.append({
+                    "component_id":   gc.id,
+                    "defect_type":    "misaligned",
+                    "expected_label": gc.label,
+                    "found_label":    _mali_fl,
+                    "cx": gc.cx, "cy": gc.cy,
+                    "details": f"zoneB_rotation_rescue {_zb_mali_reason}"})
+                continue
+
             if same_dets:
                 dist, tc = same_dets[0]
 
@@ -661,6 +857,22 @@ def _aoi_check_board(golden: list, golden_img, test_img, dets: list,
                 "details": f"flat var={test_var:.1f} ssim={ssim_v:.3f}"})
             continue
 
+
+        # -- Step 1.5: rotation-based misalignment rescue (v3.9) ---------------
+        _zc_mali_ok, _zc_mali_angle, _zc_mali_reason = _aoi_misalignment_check(
+            golden_img, test_img, gc, W, H)
+        if _zc_mali_ok:
+            _mali_fl = (same_dets[0][1].label if same_dets else
+                       (cross_dets[0][1].label if cross_dets else gc.label))
+            defects.append({
+                "component_id":   gc.id,
+                "defect_type":    "misaligned",
+                "expected_label": gc.label,
+                "found_label":    _mali_fl,
+                "cx": gc.cx, "cy": gc.cy,
+                "details": f"zoneC_rotation_rescue {_zc_mali_reason}"})
+            continue
+
         # ── Step 2: polarity check (non-flat, polarized components) ──────────
         # Compound acceptance logic validated across 100-board runs (v3.6):
         #   (a) delta > STRONG (0.95)         → unconditional WPOL (all ICs + strong caps)
@@ -687,6 +899,19 @@ def _aoi_check_board(golden: list, golden_img, test_img, dets: list,
                 if ssim_v >= _AOI_SSIM_POL_STRUCT and tmpl_v >= _AOI_TMPL_POL_STRUCT:
                     accept_polarity = True
 
+            # -- v3.9 Fix N: GOH + asymmetry fallback ---------------------
+            if not accept_polarity:
+                goh_flip, goh_delta = _aoi_goh_polarity(
+                    golden_img, test_img, gc, W, H)
+                if goh_delta >= _GOH_POLAR_MIN_DELTA:
+                    accept_polarity = True
+                elif (_GOH_ASYM_VOTE_BAND_LO <= goh_delta
+                      < _GOH_ASYM_VOTE_BAND_HI):
+                    asym_score = _aoi_intensity_asymmetry_score(
+                        golden_img, test_img, gc, W, H)
+                    if asym_score >= _ASYM_POLAR_MIN:
+                        accept_polarity = True
+
             if accept_polarity:
                 fl = (same_dets[0][1].label if same_dets else
                       (cross_dets[0][1].label if cross_dets else gc.label))
@@ -698,6 +923,8 @@ def _aoi_check_board(golden: list, golden_img, test_img, dets: list,
                     "cx": gc.cx, "cy": gc.cy,
                     "details": f"ncc_delta={ncc_delta:.4f} ssim={ssim_v:.3f} tmpl={tmpl_v:.3f}"})
                 continue
+
+
 
         # ── Step 3: cross-label det owns slot ────────────────────────────────
         # Polarized components that failed the polarity check arrive here.
@@ -798,14 +1025,25 @@ def _aoi_check_board(golden: list, golden_img, test_img, dets: list,
                     "details": (f"var_rescue_nodet({test_var:.0f})" if var_structured
                                 else f"ssim_only({ssim_v:.2f})")})
         else:
-            # All signals say nothing is here → missing
-            defects.append({
-                "component_id":   gc.id,
-                "defect_type":    "missing",
-                "expected_label": gc.label,
-                "found_label":    "none",
-                "cx": gc.cx, "cy": gc.cy,
-                "details": f"ssim_low({ssim_v:.3f}) var({test_var:.1f}) tmpl({tmpl_v:.3f})"})
+            # -- v3.9 Fix O: edge-density rescue -------------------------------
+            edge_d = _aoi_edge_density(t_sm, gc, dW, dH)
+            if edge_d >= _EDGE_DENSITY_WC_MIN:
+                found_lbl = same_dets[0][1].label if same_dets else "unknown"
+                defects.append({
+                    "component_id":   gc.id,
+                    "defect_type":    "wrong_component",
+                    "expected_label": gc.label,
+                    "found_label":    found_lbl,
+                    "cx": gc.cx, "cy": gc.cy,
+                    "details": f"edge_rescue({edge_d:.3f})"})
+            else:
+                defects.append({
+                    "component_id":   gc.id,
+                    "defect_type":    "missing",
+                    "expected_label": gc.label,
+                    "found_label":    "none",
+                    "cx": gc.cx, "cy": gc.cy,
+                    "details": f"ssim_low({ssim_v:.3f}) var({test_var:.1f}) tmpl({tmpl_v:.3f})"})
 
     return defects, match
 

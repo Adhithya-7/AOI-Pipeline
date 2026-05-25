@@ -872,7 +872,7 @@ class OfflineAOITab(QWidget):
 
                 _DEFECT_COL = {
                     "missing":         (40, 40,230),
-                    "misaligned":      (40,165,255),
+                    "misaligned":      (0,255,255),
                     "wrong_component": (200,40,200),
                     "wrong_polarity":  (40,165,255),
                 }

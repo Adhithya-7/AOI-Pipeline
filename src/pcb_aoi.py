@@ -23,6 +23,7 @@ DEFAULT_OUTPUT_DIR    = r"D:\MELSS\AOI\aoi_output"
 DEFAULT_CONF          = "0.25"
 DEFAULT_IOU_MATCH     = "0.30"   # min IoU to consider two boxes the "same" component
 DEFAULT_MISALIGN_PX   = "15"     # pixel distance threshold to flag misalignment
+DEFAULT_MISALIGN_ANGLE= "8"      # rotation angle threshold (degrees) to flag misalignment
 DEFAULT_WRONG_IOU     = "0.40"   # tighter IoU to flag wrong-class at a position
 
 
@@ -72,6 +73,72 @@ def iou(a, b):
 
 def center(box):
     return ((box[0]+box[2])/2, (box[1]+box[3])/2)
+
+
+def _patch_orientation_px(img, box):
+    """Compute principal orientation angle of a component from its pixel bounding box.
+
+    Uses Canny edge detection + cv2.minAreaRect on the largest contour.
+    Falls back to image moments when contour analysis fails.
+
+    Args:
+        img:  BGR image (numpy array)
+        box:  [x1, y1, x2, y2] pixel coordinates
+
+    Returns:
+        angle in degrees [0, 180), or None if patch is too small/featureless.
+    """
+    x1, y1, x2, y2 = [int(v) for v in box]
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return None
+
+    patch = img[y1:y2, x1:x2]
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(blurred, 30, 100)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        # Fallback: image moments (PCA-like orientation)
+        import math
+        M = cv2.moments(blurred)
+        if abs(M["mu20"] - M["mu02"]) < 1e-6:
+            return None
+        angle = 0.5 * math.degrees(math.atan2(2 * M["mu11"],
+                                                M["mu20"] - M["mu02"]))
+        return angle % 180
+
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 20:
+        return None
+
+    rect = cv2.minAreaRect(largest)
+    angle = rect[2]
+    w_r, h_r = rect[1]
+
+    # Normalise: minAreaRect angle of shorter side → [0, 180)
+    if w_r < h_r:
+        angle = angle + 90
+    angle = angle % 180
+    return angle
+
+
+def _compute_angle_delta(golden_bgr, test_bgr, g_box, t_box):
+    """Compute angular difference between golden and test component patches.
+
+    Returns angle delta in degrees [0, 90], or 0.0 if orientation cannot be determined.
+    """
+    g_angle = _patch_orientation_px(golden_bgr, g_box)
+    t_angle = _patch_orientation_px(test_bgr, t_box)
+
+    if g_angle is None or t_angle is None:
+        return 0.0
+
+    delta = abs(g_angle - t_angle)
+    if delta > 90:
+        delta = 180 - delta
+    return delta
 
 
 # ══════════════════════════════════════════════
@@ -137,11 +204,13 @@ def align_to_golden(golden_bgr, test_bgr):
 #  COMPARISON LOGIC
 # ══════════════════════════════════════════════
 
-def compare(golden_comps, test_comps, iou_match, misalign_px, wrong_iou):
+def compare(golden_comps, test_comps, iou_match, misalign_px, wrong_iou,
+            golden_bgr=None, test_bgr=None, misalign_angle=8.0):
     """
     Returns four lists:
         missing    – in golden but nothing nearby in test
         misaligned – correct class found but center offset > threshold
+                     OR rotation angle > misalign_angle threshold
         wrong      – something is at that location but different class
         extra      – in test but nothing nearby in golden
     """
@@ -184,12 +253,26 @@ def compare(golden_comps, test_comps, iou_match, misalign_px, wrong_iou):
                     "offset_px": round(dist, 1),
                 })
             elif dist > misalign_px:
-                # Correct class but shifted → MISALIGNED
+                # Correct class but shifted → MISALIGNED (offset)
                 misaligned.append({
-                    "golden"   : g,
-                    "test"     : t,
-                    "offset_px": round(dist, 1),
+                    "golden"    : g,
+                    "test"      : t,
+                    "offset_px" : round(dist, 1),
+                    "type"      : "offset",
                 })
+            else:
+                # Same class, within centroid tolerance — check rotation
+                if golden_bgr is not None and test_bgr is not None:
+                    angle_delta = _compute_angle_delta(
+                        golden_bgr, test_bgr, g["box"], t["box"])
+                    if angle_delta > misalign_angle:
+                        misaligned.append({
+                            "golden"      : g,
+                            "test"        : t,
+                            "offset_px"   : round(dist, 1),
+                            "angle_delta" : round(angle_delta, 1),
+                            "type"        : "rotation",
+                        })
 
     for i, t in enumerate(test_comps):
         if i not in used_test:
@@ -237,7 +320,13 @@ def annotate(base_img, golden_comps, missing, misaligned, wrong, extra, board_na
     for item in misaligned:
         t  = item["test"]
         g  = item["golden"]
-        _label(img, t["box"], f"MISALIGN {t['class']} {item['offset_px']}px", COLORS["MISALIGNED"], 2)
+        mali_type = item.get("type", "offset")
+        if mali_type == "rotation":
+            angle = item.get("angle_delta", 0)
+            label_text = f"MISALIGN(rot) {t['class']} {angle:.0f}deg"
+        else:
+            label_text = f"MISALIGN {t['class']} {item['offset_px']}px"
+        _label(img, t["box"], label_text, COLORS["MISALIGNED"], 2)
         gc = tuple([int(v) for v in center(g["box"])])
         tc = tuple([int(v) for v in center(t["box"])])
         cv2.arrowedLine(img, gc, tc, COLORS["MISALIGNED"], 2, tipLength=0.3)
@@ -349,6 +438,7 @@ def main():
     conf         = float(ask("Detection confidence (e.g. 0.25)", DEFAULT_CONF))
     iou_match    = float(ask("Component match IoU   (e.g. 0.30)", DEFAULT_IOU_MATCH))
     misalign_px  = float(ask("Misalign threshold px (e.g. 15)",   DEFAULT_MISALIGN_PX))
+    misalign_ang = float(ask("Misalign angle thresh (e.g. 8)",    DEFAULT_MISALIGN_ANGLE))
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -468,7 +558,10 @@ def main():
 
         # Compare
         missing, misaligned, wrong, extra = compare(
-            golden_comps, test_comps, iou_match, misalign_px, float(DEFAULT_WRONG_IOU)
+            golden_comps, test_comps, iou_match, misalign_px,
+            float(DEFAULT_WRONG_IOU),
+            golden_bgr=golden_bgr, test_bgr=aligned_bgr,
+            misalign_angle=misalign_ang
         )
 
         status = "PASS" if (len(missing) + len(misaligned) + len(wrong)) == 0 else "FAIL"
