@@ -6,7 +6,7 @@ infer_arr, hungarian_match, region_diff, calibrate, ncc_polarity,
 patch_ssim, patch_variance, patch_tmpl, same_det_is_local, check_board,
 render_overlay), and OfflineAOIThread.
 """
-import os, sys, time, math, copy
+import os, sys, time, math
 from dataclasses import dataclass as _dataclass
 
 if __package__ in (None, ""):
@@ -23,7 +23,7 @@ from .utils import (
     _AOIComp, _AOI_SAHI_TRIGGER, _AOI_SLICE_HW, _AOI_OVERLAP, _AOI_MATCH_R,
     _aoi_get_sahi_model, _aoi_bbox_overlap, _aoi_nms_by_centre, _aoi_infer_arr
 )
-from .filters import apply_filters, run_roi
+from .filters import apply_filters
 
 if HAS_CV2:
     import cv2
@@ -1184,8 +1184,7 @@ class OfflineAOIThread(QThread):
     def __init__(self, golden_path: str, test_paths: list,
                  model_path: str, conf: float,
                  use_sahi: bool, cal_runs: int,
-                 filters: list = None, rois: list = None,
-                 pipe_model=None):
+                 filters: list = None):
         super().__init__()
         self._golden_path = golden_path
         self._test_paths  = list(test_paths)
@@ -1194,8 +1193,6 @@ class OfflineAOIThread(QThread):
         self._use_sahi    = use_sahi
         self._cal_runs    = cal_runs
         self._filters     = filters or []
-        self._rois        = rois or []
-        self._pipe_model  = pipe_model   # pre-built ROI YOLO model
         self._abort       = False
 
     def abort(self): self._abort = True
@@ -1321,14 +1318,8 @@ class OfflineAOIThread(QThread):
             # Apply filter pipeline
             proc_img = apply_filters(test_img, self._filters) if self._filters else test_img
 
-            # ROI zones
+            # ROI zones (scraped)
             roi_results = []; roi_fail = False
-            for roi in self._rois:
-                res = run_roi(proc_img, roi, self._pipe_model)
-                if not res.get('passed'): roi_fail = True
-                roi_results.append({'name':roi.name,'type':roi.zone_type,
-                                    'passed':res.get('passed',False),
-                                    'info':res.get('info','')})
 
             # YOLO inference on test board
             ti = _t.time()
@@ -1355,16 +1346,8 @@ class OfflineAOIThread(QThread):
             defects, board_match = _aoi_check_board(golden_dets, golden_img, proc_img,
                                         dets, pos_tol, per_thr, poly_mult,
                                         match_radius=match_r)
-            if roi_fail:
-                for rr in roi_results:
-                    if not rr['passed']:
-                        defects.append({'component_id':-1,'defect_type':'roi_fail',
-                            'expected_label':rr['name'],'found_label':rr['type'],
-                            'details':f"ROI {rr['name']}: {rr['info']}"})
-
             _DS = {"missing":"MISSING","wrong_component":"WRONG PART",
-                   "misaligned":"MISALIGNED","wrong_polarity":"WRONG POLARITY",
-                   "roi_fail":"ROI FAIL"}
+                   "misaligned":"MISALIGNED","wrong_polarity":"WRONG POLARITY"}
             if defects:
                 _emit(f"[AOI] [{i+1}/{n}] {len(defects)} DEFECT(S):")
                 for _def in defects:

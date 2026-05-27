@@ -1,11 +1,9 @@
 """
 run_tab.py — Live inspection tab (RunTab).
 """
-import glob
 import json
 import os
 import platform
-import shutil
 import sys
 import threading
 import time
@@ -48,7 +46,7 @@ from ..utils import (
 )
 from ..threads import CameraThread, InferenceThread
 from ..aoi_engine import _AOIComp, _MIN_POS_TOL, _aoi_calibrate, _aoi_check_board
-from ..filters import apply_filters, run_roi
+from ..filters import apply_filters
 from ..widgets import (
     AnnunciatorBanner, FastLog, LabelCanvas, ProjectDialog,
     ResultStrip, StatCard, ToastManager, VideoWidget
@@ -72,7 +70,7 @@ class RunTab(QWidget):
         self._golden=[]; self._persist={}
         self._pass=self._fail=self._total=0
         self._latest_dets=[]; self._last_missing=[]
-        self._pipe_filters=[]; self._pipe_rois=[]; self._pipe_model=None; self._pipe_active=False
+        self._pipe_filters=[]; self._pipe_model=None; self._pipe_active=False
         self._last_yield_col=None
         # Direct-inference bypass state (for OpenVINO / InferenceThread-incompatible models)
         self._direct_infer_busy = False
@@ -264,8 +262,8 @@ class RunTab(QWidget):
         gr.addWidget(self._gm_lbl,1); gr.addWidget(b_lgm); R.addLayout(gr)
         root.addLayout(R,1) if False else None  # R_widget added above
 
-    def deploy_pipeline(self,filters,rois,model_path=None):
-        self._pipe_filters=list(filters); self._pipe_rois=list(rois); self._pipe_active=bool(rois or filters); self._pipe_model=None
+    def deploy_pipeline(self,filters,model_path=None):
+        self._pipe_filters=list(filters); self._pipe_active=bool(filters); self._pipe_model=None
         # Invalidate golden cache — filters changed so the pre-filtered golden is stale
         self._golden_bgr_cache = None; self._golden_filter_sig = ()
         # Use plain _YOLO (same as aoi_tab) — load_optimized_yolo can silently return a
@@ -279,7 +277,7 @@ class RunTab(QWidget):
                 self._log.append(f"[Model] Loaded: {os.path.basename(model_path)}")
             except Exception as e:
                 self._log.append(f"[Model] Load error: {e}")
-        self._pipe_lbl.setText(f"Pipeline: {len(filters)} filters | {len(rois)} zones")
+        self._pipe_lbl.setText(f"Pipeline: {len(filters)} filters")
         self._pipe_lbl.setStyleSheet(f"#plbl{{color:{CYAN};font-size:11px;font-family:Consolas;border:none;}}")
         self._update_inspect_btn()
 
@@ -303,15 +301,8 @@ class RunTab(QWidget):
         # Apply filter pipeline
         filtered = apply_filters(frame, self._pipe_filters)
 
-        # ── ROI zone checks ───────────────────────────────────────────────
+        # ── ROI zone checks (scraped) ─────────────────────────────────────
         all_ok = True; roi_disp = []
-        for roi in self._pipe_rois:
-            res = run_roi(filtered, roi, self._pipe_model)
-            passed = res.get("passed", False); info = res.get("info", "")
-            if not passed: all_ok = False
-            self._log.append(f"[{ts}] {'OK' if passed else 'FAIL'} [{roi.zone_type.upper()}] {roi.name}: {info}")
-            roi_disp.append({"name":roi.name,"rect":roi.rect,"type":roi.zone_type,
-                             "passed":passed,"info":info[:20]})
 
         thresh = self._conf.value() / 100
 
@@ -951,7 +942,7 @@ class RunTab(QWidget):
         self._cam.frame_ready.connect(self._on_frame,Qt.ConnectionType.QueuedConnection)
         self._cam.error.connect(lambda e:(self._log.append(e),self._stop()))
         self._cam.start()
-        self._ai=InferenceThread(self._cfg,self._cam,self._pipe_filters,self._pipe_rois)
+        self._ai=InferenceThread(self._cfg,self._cam,self._pipe_filters)
 
         self._ai.result_ready.connect(self._on_result,Qt.ConnectionType.QueuedConnection)
         self._ai.log.connect(self._log.append)  # FastLog buffers these automatically
@@ -1157,7 +1148,6 @@ class RunTab(QWidget):
             try:
                 import json
                 from ois.filters import FILTER_REGISTRY
-                from ois.widgets import ROIZone
                 with open(saved_pipe) as f:
                     cfg = json.load(f)
 
@@ -1170,14 +1160,8 @@ class RunTab(QWidget):
                         n.enabled = fc.get("enabled", True)
                         filters.append(n)
 
-                rois = []
-                for rc in cfg.get("rois", []):
-                    rz = ROIZone(rc.get("name","Zone"), rc.get("type","yolo"), rc.get("rect",[0,0,60,60]))
-                    rz.enabled = rc.get("enabled", True)
-                    rois.append(rz)
-
                 mp = self._cfg.get("model_path")
-                self.deploy_pipeline(filters, rois, mp)
+                self.deploy_pipeline(filters, mp)
                 self._log.append(f"[Project] Pipeline auto-loaded")
             except Exception as e:
                 self._log.append(f"[Project] Pipeline load failed: {e}")
@@ -1185,7 +1169,7 @@ class RunTab(QWidget):
             # Default fallback: load model alone if no pipeline exists
             mp = self._cfg.get("model_path")
             if mp and os.path.exists(mp):
-                self.deploy_pipeline([], [], mp)
+                self.deploy_pipeline([], mp)
 
     def keyPressEvent(self,e):
         if e.key()==Qt.Key.Key_S: self._upload_master()

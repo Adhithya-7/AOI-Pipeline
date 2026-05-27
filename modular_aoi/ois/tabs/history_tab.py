@@ -1,11 +1,9 @@
 """
 history_tab.py — Inspection results history tab (HistoryTab).
 """
-import glob
 import json
 import os
 import platform
-import shutil
 import sys
 import time
 from datetime import datetime

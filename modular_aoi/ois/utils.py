@@ -29,10 +29,6 @@ try:    from PIL import Image as PILImage;     HAS_PIL  = True
 except: HAS_PIL  = False
 try:    from ultralytics import YOLO as _YOLO; HAS_YOLO = True
 except: HAS_YOLO = False
-try:    import pytesseract;                    HAS_OCR  = True
-except: HAS_OCR  = False
-try:    from pyzbar import pyzbar;             HAS_ZBAR = True
-except: HAS_ZBAR = False
 
 try:
     from sahi import AutoDetectionModel as _SAHIModel

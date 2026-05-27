@@ -121,13 +121,11 @@ Python 3.9+ is recommended (PySide6 requires ≥ 3.8; PyInstaller builds target 
 ### Install dependencies
 
 ```bash
-pip install ultralytics opencv-python numpy PySide6 Pillow scipy pyyaml platformdirs psutil pynvml pytesseract pyzbar sahi
+pip install ultralytics opencv-python numpy PySide6 Pillow scipy pyyaml platformdirs psutil pynvml sahi
 ```
 
 **Optional but recommended:**
 - `psutil` and `pynvml` — enable the real-time CPU/GPU status bar in the GUI.
-- `pytesseract` — enables OCR filter nodes in the inspection pipeline.
-- `pyzbar` — enables barcode/QR-code scanning filter nodes.
 - `sahi` — enables tiled inference for very large PCB images (longest edge > 1280px in generator; > 1920px in OIS GUI).
 
 ### Model weights
@@ -525,7 +523,7 @@ This package is a modular refactoring of `src/optical_inspection_system.py`. All
 
 #### **`utils.py`**
 
-Pure data layer — no Qt widgets. Contains: optional-dependency feature flags (`HAS_CV2`, `HAS_NP`, `HAS_YOLO`, `HAS_SAHI`, `HAS_OCR`, `HAS_ZBAR`), the portable data-directory resolver (`DATA_ROOT` via `platformdirs` or `~/.ois_data`), the `_AOIComp` dataclass, SAHI inference constants, `ProjectConfig` (project settings manager), `SettingsDialog`, `HistoryDB` (SQLite history store with WAL journal mode), `MASTER_CLASS_LIST` (the 25-class list), `match_detections`, and helper functions (`calc_iou`, `safe_predict`, `load_optimized_yolo`, `find_best_pt`, `build_golden_dataset`, `DEFAULT_AUG`).
+Pure data layer — no Qt widgets. Contains: optional-dependency feature flags (`HAS_CV2`, `HAS_NP`, `HAS_YOLO`, `HAS_SAHI`), the portable data-directory resolver (`DATA_ROOT` via `platformdirs` or `~/.ois_data`), the `_AOIComp` dataclass, SAHI inference constants, `ProjectConfig` (project settings manager), `SettingsDialog`, `HistoryDB` (SQLite history store with WAL journal mode), `MASTER_CLASS_LIST` (the 25-class list), `match_detections`, and helper functions (`calc_iou`, `safe_predict`, `load_optimized_yolo`, `find_best_pt`, `build_golden_dataset`, `DEFAULT_AUG`).
 
 Not a runnable script; imported by all other modules in the package.
 
@@ -533,7 +531,7 @@ Not a runnable script; imported by all other modules in the package.
 
 #### **`filters.py`**
 
-Filter node system and auto-calibration. Defines the `FilterNode` base class and all concrete filter implementations: `CLAHEFilter`, `GaussBlurFilter`, `SharpenFilter`, `GammaFilter`, `ThresholdFilter`, `BilateralFilter`, `OCRFilter`, `BarcodeFilter`, `ROIFilter`. Provides `apply_filters(pipeline, image)` and `run_roi(roi_filter, image)`. Also contains `AutoCalibrateWorker` (a `QThread` that scores filter pipeline variants against a reference image) and the `auto_build_pipeline` function.
+Filter node system and auto-calibration. Defines the `FilterNode` base class and all concrete filter implementations: `CLAHEFilter`, `GaussBlurFilter`, `SharpenFilter`, `GammaFilter`, `ThresholdFilter`, `BilateralFilter`. Provides `apply_filters(pipeline, image)`. Also contains `AutoCalibrateWorker` (a `QThread` that scores filter pipeline variants against a reference image) and the `auto_build_pipeline` function.
 
 Not a runnable script; imported by `aoi_engine.py`, `threads.py`, and several tabs.
 

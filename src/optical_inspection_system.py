@@ -58,7 +58,7 @@ CHANGES vs v6.0 (v7.0):
   8. MainWindow._switch() idempotency guard
   9. AA_UseHighDpiPixmaps removed (deprecated in Qt6)
 """
-import sys, os, json, shutil, random, glob, time, platform, threading, sqlite3, tempfile
+import sys, os, json, shutil, random, glob, time, platform, threading, sqlite3
 import math, copy                         # pulled to top — no more per-call inline imports
 from datetime import datetime
 from collections import deque
@@ -78,10 +78,8 @@ try:    from PIL import Image as PILImage;     HAS_PIL  = True
 except: HAS_PIL  = False
 try:    from ultralytics import YOLO as _YOLO; HAS_YOLO = True
 except: HAS_YOLO = False
-try:    import pytesseract;                    HAS_OCR  = True
-except: HAS_OCR  = False
-try:    from pyzbar import pyzbar;             HAS_ZBAR = True
-except: HAS_ZBAR = False
+# Optional dependencies pytesseract/pyzbar removed
+
 
 try:
     from sahi import AutoDetectionModel as _SAHIModel
@@ -1792,27 +1790,8 @@ class AutoCalibrateWorker(QThread):
             self.done.emit(None, f"Calibration error: {e}")
 
 
-def run_roi(img,roi,model=None):
-    x,y,rw,rh=roi.rect; ih,iw=img.shape[:2]
-    x1,y1=max(0,x),max(0,y); x2,y2=min(iw,x+rw),min(ih,y+rh)
-    if x2<=x1 or y2<=y1: return {"passed":False,"info":"bad crop"}
-    crop=img[y1:y2,x1:x2]
-    if roi.zone_type=="yolo":
-        if model is None: return {"passed":False,"info":"no model"}
-        try: res=model.predict(crop,conf=0.4,verbose=False)[0]; n=len(res.boxes); return {"passed":n>0,"info":f"{n} obj"}
-        except Exception as e: return {"passed":False,"info":str(e)[:20]}
-    elif roi.zone_type=="ocr":
-        if not HAS_OCR: return {"passed":False,"info":"no pytesseract"}
-        try: t=pytesseract.image_to_string(crop,config="--psm 7").strip(); return {"passed":bool(t),"info":t[:20] or "empty"}
-        except Exception as e: return {"passed":False,"info":str(e)[:20]}
-    elif roi.zone_type=="barcode":
-        if not HAS_ZBAR: return {"passed":False,"info":"no pyzbar"}
-        try:
-            codes=pyzbar.decode(crop)
-            if codes: return {"passed":True,"info":f"{codes[0].type}:{codes[0].data.decode()[:12]}"}
-            return {"passed":False,"info":"no barcode"}
-        except Exception as e: return {"passed":False,"info":str(e)[:20]}
-    return {"passed":False,"info":"unknown type"}
+# run_roi helper function scraped
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1867,11 +1846,10 @@ class VideoWidget(QLabel):
     def set_detections(self,dets,golden,missing_indices):
         self._dets=dets; self._golden=golden; self._missing=set(missing_indices)  # set of int golden-slot indices
         if self._raw_px: self._compose()
-    def set_roi_results(self,rr):
-        self._roi_res=rr
-        if self._raw_px: self._compose()
+    def set_roi_results(self, rr):
+        pass
     def clear(self):
-        self._raw_px=None; self._dets=[]; self._golden=[]; self._missing=set(); self._roi_res=[]; self._show_idle()
+        self._raw_px=None; self._dets=[]; self._golden=[]; self._missing=set(); self._show_idle()
     def _compose(self):
         W,H=self.width(),self.height()
         if W<10 or H<10 or self._raw_px is None: return
@@ -1893,13 +1871,6 @@ class VideoWidget(QLabel):
             p.setPen(QPen(col,2)); p.setBrush(QBrush(QColor(col.red(),col.green(),col.blue(),18)))
             p.drawRect(s1x,s1y,s2x-s1x,s2y-s1y); p.setPen(QPen(col))
             p.drawText(s1x,s1y-4,f"{d['name']} {c:.2f}")
-        p.setFont(_F_MONO_8)
-        for rz in self._roi_res:
-            rx,ry,rw2,rh2=rz["rect"]
-            col=QColor(GREEN) if rz.get("passed") else QColor(RED)
-            p.setPen(QPen(col,3,Qt.PenStyle.DotLine)); p.setBrush(QBrush(QColor(col.red(),col.green(),col.blue(),18)))
-            p.drawRect(int(rx*sx)+x0,int(ry*sy)+y0,int(rw2*sx),int(rh2*sy)); p.setPen(QPen(col))
-            p.drawText(int(rx*sx)+x0,int(ry*sy)+y0-4,f"[{rz['type'].upper()}] {rz['name']}: {rz.get('info','')[:20]}")
         # Corner brackets (scan frame effect)
         cm=QColor(CYAN); cm.setAlpha(140); p.setPen(QPen(cm,2)); cs=18
         for cx2,cy2 in [(10,10),(W-10-cs,10),(10,H-10-cs),(W-10-cs,H-10-cs)]:
@@ -2145,190 +2116,7 @@ class LabelCanvas(QWidget):
         self._scale=new_scale; self._scaled=None; self.update()
 
 
-class ROIZone:
-    def __init__(self,name,zone_type,rect): self.name=name; self.zone_type=zone_type; self.rect=rect; self.enabled=True
-    def get_config(self): return {"name":self.name,"type":self.zone_type,"rect":self.rect,"enabled":self.enabled}
-
-class ROICanvas(QWidget):
-    roi_added=Signal(object); roi_modified=Signal(object); roi_removed=Signal(object); HS=8
-    def __init__(self):
-        super().__init__(); self.setMouseTracking(True); self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
-        self._px=None; self._ow=self._oh=1; self._scale=1.0; self._ox=self._oy=0.0
-        self._default_zone_type="yolo"
-        self.rois=[]; self._sel=None; self._drawing=False; self._sx=self._sy=self._mx=self._my=0
-        self._drag_handle=None; self._drag_start=None; self._drag_rect=None
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent,True)
-        self._rtimer=QTimer(); self._rtimer.setSingleShot(True); self._rtimer.timeout.connect(self._fit)
-        self._dirty=False; self._dt=QTimer(self); self._dt.setInterval(16)
-        self._dt.timeout.connect(self._flush_dirty); self._dt.start()
-        # Zoom sync peer support
-        self._fit_scale=1.0; self._peer_ziv=None; self._sync_blocked_ziv=False
-        # Middle-click pan support
-        self._panning=False; self._pan_sx=self._pan_sy=0; self._pan_ox=self._pan_oy=0.0
-    def _flush_dirty(self):
-        if self._dirty: self._dirty=False; self.update()
-    def load_frame(self,bgr):
-        if not HAS_CV2 or not HAS_NP: return
-        rgb=cv2.cvtColor(bgr,cv2.COLOR_BGR2RGB); self._oh,self._ow=rgb.shape[:2]
-        self._px=QImage(rgb.tobytes(),self._ow,self._oh,self._ow*3,QImage.Format.Format_RGB888).copy(); self._fit()
-    def load_image(self,path):
-        self._px=QImage(path)
-        if not self._px.isNull(): self._ow=self._px.width(); self._oh=self._px.height()
-        self._fit()
-    def _fit(self):
-        cw,ch=max(1,self.width()),max(1,self.height()); self._scale=min(cw/self._ow,ch/self._oh)
-        self._ox=(cw-self._ow*self._scale)/2; self._oy=(ch-self._oh*self._scale)/2
-        self._fit_scale=self._scale   # record fit-zoom for sync conversion
-        self.update()
-    def resizeEvent(self,e): self._rtimer.start(60)
-    def paintEvent(self,e):
-        p=QPainter(self); W,H=self.width(),self.height(); p.fillRect(0,0,W,H,QColor("#111111"))
-        if self._px: p.drawImage(int(self._ox),int(self._oy),self._px.scaled(int(self._ow*self._scale),int(self._oh*self._scale)))
-        else:
-            p.setPen(QPen(QColor(TEXT_DIM))); p.setFont(_F_MONO_11)
-            p.drawText(QRect(0,0,W,H),Qt.AlignmentFlag.AlignCenter,"Grab frame from camera\nor load a reference image")
-        for roi in self.rois: self._draw_roi(p,roi,roi==self._sel)
-        if self._drawing:
-            p.setPen(QPen(QColor(CYAN),2,Qt.PenStyle.DashLine)); p.setBrush(Qt.BrushStyle.NoBrush)
-            x1,y1=min(self._sx,self._mx),min(self._sy,self._my)
-            p.drawRect(int(x1),int(y1),int(abs(self._mx-self._sx)),int(abs(self._my-self._sy)))
-        if not self._drag_handle:
-            p.setPen(QPen(QColor(255,255,255,40),1,Qt.PenStyle.DashLine))
-            p.drawLine(int(self._mx),0,int(self._mx),H); p.drawLine(0,int(self._my),W,int(self._my))
-    def _draw_roi(self,p,roi,sel):
-        x,y,rw,rh=roi.rect; sx=int(x*self._scale+self._ox); sy=int(y*self._scale+self._oy)
-        sw=int(rw*self._scale); sh=int(rh*self._scale)
-        col={"ocr":QColor(GREEN),"barcode":QColor(PURPLE)}.get(roi.zone_type,QColor(CYAN))
-        p.setPen(QPen(col,3 if sel else 2)); p.setBrush(QBrush(QColor(col.red(),col.green(),col.blue(),20 if sel else 10)))
-        p.drawRect(sx,sy,sw,sh); p.setFont(_F_MONO_10); p.setPen(QPen(col))
-        p.drawText(sx,sy-4,f"{roi.name} [{roi.zone_type.upper()}]")
-        if sel:
-            hs=self.HS
-            for hx,hy in [(sx,sy),(sx+sw,sy),(sx,sy+sh),(sx+sw,sy+sh),(sx+sw//2,sy),(sx+sw//2,sy+sh),(sx,sy+sh//2),(sx+sw,sy+sh//2)]:
-                p.setPen(QPen(QColor(255,255,255),1)); p.setBrush(QBrush(col)); p.drawRect(hx-hs//2,hy-hs//2,hs,hs)
-    def mousePressEvent(self,e):
-        if e.button()==Qt.MouseButton.MiddleButton:
-            self._panning=True
-            self._pan_sx,self._pan_sy=e.position().x(),e.position().y()
-            self._pan_ox,self._pan_oy=self._ox,self._oy
-            self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor)); return
-        if e.button()==Qt.MouseButton.LeftButton:
-            mx,my=e.position().x(),e.position().y()
-            if self._sel:
-                h=self._handle_at(mx,my,self._sel)
-                if h: self._drag_handle=h; self._drag_start=(mx,my); self._drag_rect=list(self._sel.rect); return
-            r=self._roi_at(mx,my)
-            if r: self._sel=r; self._drag_handle="move"; self._drag_start=(mx,my); self._drag_rect=list(r.rect); self.update(); return
-            self._sel=None; self._sx,self._sy=mx,my; self._drawing=True
-        elif e.button()==Qt.MouseButton.RightButton:
-            if self._drawing: self._drawing=False
-            elif self._sel:
-                _removed=self._sel
-                self.rois.remove(self._sel); self._sel=None
-                self.roi_removed.emit(_removed)
-            self.update()
-    def mouseMoveEvent(self,e):
-        self._mx,self._my=e.position().x(),e.position().y()
-        if self._panning:
-            self._ox=self._pan_ox+(self._mx-self._pan_sx)
-            self._oy=self._pan_oy+(self._my-self._pan_sy)
-            self._dirty=True; self._push_sync_to_ziv(); return
-        if self._drag_handle and self._sel: self._do_drag(self._mx,self._my)
-        self._dirty=True
-    def mouseReleaseEvent(self,e):
-        if e.button()==Qt.MouseButton.MiddleButton and self._panning:
-            self._panning=False; self.setCursor(QCursor(Qt.CursorShape.CrossCursor)); return
-        if e.button()==Qt.MouseButton.LeftButton:
-            if self._drag_handle: self._drag_handle=None; self._drag_start=None; self._drag_rect=None
-            elif self._drawing: self._finish(e.position().x(),e.position().y())
-            if self._sel: self.roi_modified.emit(self._sel)
-    def _finish(self,ex,ey):
-        self._drawing=False
-        x1=(min(self._sx,ex)-self._ox)/self._scale; y1=(min(self._sy,ey)-self._oy)/self._scale
-        x2=(max(self._sx,ex)-self._ox)/self._scale; y2=(max(self._sy,ey)-self._oy)/self._scale
-        x1,y1=max(0,x1),max(0,y1); x2,y2=min(self._ow,x2),min(self._oh,y2)
-        wi,hi=int(x2-x1),int(y2-y1)
-        if wi>20 and hi>20:
-            roi=ROIZone(f"Zone_{len(self.rois)+1}",self._default_zone_type,[int(x1),int(y1),wi,hi])
-            self.rois.append(roi); self._sel=roi; self.roi_added.emit(roi)
-        self.update()
-    def _handle_at(self,mx,my,roi):
-        x,y,rw,rh=roi.rect; sx=int(x*self._scale+self._ox); sy=int(y*self._scale+self._oy)
-        sw=int(rw*self._scale); sh=int(rh*self._scale); hs=self.HS
-        pts={"tl":(sx,sy),"tr":(sx+sw,sy),"bl":(sx,sy+sh),"br":(sx+sw,sy+sh),
-             "t":(sx+sw//2,sy),"b":(sx+sw//2,sy+sh),"l":(sx,sy+sh//2),"r":(sx+sw,sy+sh//2)}
-        for n,(hx,hy) in pts.items():
-            if abs(mx-hx)<hs and abs(my-hy)<hs: return n
-        return None
-    def _roi_at(self,mx,my):
-        for roi in reversed(self.rois):
-            x,y,rw,rh=roi.rect; sx=x*self._scale+self._ox; sy=y*self._scale+self._oy
-            if sx<=mx<=sx+rw*self._scale and sy<=my<=sy+rh*self._scale: return roi
-        return None
-    def _do_drag(self,mx,my):
-        smx,smy=self._drag_start; dx=(mx-smx)/self._scale; dy=(my-smy)/self._scale
-        x,y,rw,rh=self._drag_rect; r=self._sel
-        if self._drag_handle=="move": r.rect=[max(0,int(x+dx)),max(0,int(y+dy)),rw,rh]
-        elif self._drag_handle=="br": r.rect=[x,y,max(20,int(rw+dx)),max(20,int(rh+dy))]
-        elif self._drag_handle=="tl": r.rect=[max(0,int(x+dx)),max(0,int(y+dy)),max(20,int(rw-dx)),max(20,int(rh-dy))]
-        elif self._drag_handle=="tr": r.rect=[x,max(0,int(y+dy)),max(20,int(rw+dx)),max(20,int(rh-dy))]
-        elif self._drag_handle=="bl": r.rect=[max(0,int(x+dx)),y,max(20,int(rw-dx)),max(20,int(rh+dy))]
-        elif self._drag_handle=="t":  r.rect=[x,max(0,int(y+dy)),rw,max(20,int(rh-dy))]
-        elif self._drag_handle=="b":  r.rect=[x,y,rw,max(20,int(rh+dy))]
-        elif self._drag_handle=="l":  r.rect=[max(0,int(x+dx)),y,max(20,int(rw-dx)),rh]
-        elif self._drag_handle=="r":  r.rect=[x,y,max(20,int(rw+dx)),rh]
-        self.update()
-    def set_selected_type(self,t):
-        if self._sel: self._sel.zone_type=t; self.update()
-    def set_default_type(self,t):
-        self._default_zone_type=t
-    def wheelEvent(self,e):
-        """Zoom the canvas view centred on cursor, then push to peer ZoomableImageView."""
-        factor=1.12 if e.angleDelta().y()>0 else (1/1.12)
-        mx,my=e.position().x(),e.position().y()
-        old=self._scale; new_scale=max(0.1,min(16,old*factor))
-        self._ox=mx-(mx-self._ox)*(new_scale/old)
-        self._oy=my-(my-self._oy)*(new_scale/old)
-        self._scale=new_scale; self._dirty=True
-        self._push_sync_to_ziv()
-    def _push_sync_to_ziv(self):
-        """Push current zoom/pan state to the paired ZoomableImageView."""
-        if not self._peer_ziv or self._sync_blocked_ziv or self._px is None: return
-        ziv=self._peer_ziv
-        if ziv._px.isNull() or self._fit_scale<=0: return
-        if not hasattr(ziv,'_fit_zoom') or ziv._fit_zoom<=0: return
-        # Compute which image-pixel sits at widget centre of this canvas
-        cw,ch=max(1,self.width()),max(1,self.height())
-        cx_img=(cw/2-self._ox)/max(1e-9,self._scale)
-        cy_img=(ch/2-self._oy)/max(1e-9,self._scale)
-        # Map scale factor to ZIV zoom
-        sf=self._scale/max(1e-9,self._fit_scale)
-        new_zoom=max(0.05,min(32.0,ziv._fit_zoom*sf))
-        zw,zh=max(1,ziv.width()),max(1,ziv.height())
-        new_ox=zw/2-cx_img*new_zoom
-        new_oy=zh/2-cy_img*new_zoom
-        ziv._sync_blocked=True
-        ziv._zoom=new_zoom; ziv._offset=(new_ox,new_oy)
-        ziv._zoom_lbl.setText(f"{new_zoom*100:.0f}%")
-        ziv.update()
-        ziv._sync_blocked=False
-    def sync_from_ziv(self,ziv_zoom,ziv_offset,ziv_fit_zoom):
-        """Apply zoom/pan received from the paired ZoomableImageView."""
-        if self._sync_blocked_ziv or self._px is None: return
-        if ziv_fit_zoom<=0 or self._fit_scale<=0 or not self._peer_ziv: return
-        self._sync_blocked_ziv=True
-        sf=ziv_zoom/max(1e-9,ziv_fit_zoom)
-        self._scale=max(0.1,self._fit_scale*sf)
-        ox_z,oy_z=ziv_offset
-        ziv=self._peer_ziv
-        zw,zh=max(1,ziv.width()),max(1,ziv.height())
-        cx_img=(zw/2-ox_z)/max(1e-9,ziv_zoom)
-        cy_img=(zh/2-oy_z)/max(1e-9,ziv_zoom)
-        cw,ch=max(1,self.width()),max(1,self.height())
-        self._ox=cw/2-cx_img*self._scale
-        self._oy=ch/2-cy_img*self._scale
-        self._dirty=True
-        self._sync_blocked_ziv=False
+# ROIZone and ROICanvas classes scraped
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2434,7 +2222,7 @@ class RunTab(QWidget):
         self._golden=[]; self._persist={}
         self._pass=self._fail=self._total=0
         self._latest_dets=[]; self._last_missing=[]
-        self._pipe_filters=[]; self._pipe_rois=[]; self._pipe_model=None; self._pipe_active=False
+        self._pipe_filters=[]; self._pipe_model=None; self._pipe_active=False
         self._last_yield_col=None
         # Golden reference image cache — avoid re-reading from disk on every inspection
         self._golden_bgr_cache: "np.ndarray|None" = None
@@ -2623,14 +2411,14 @@ class RunTab(QWidget):
         gr.addWidget(self._gm_lbl,1); gr.addWidget(b_lgm); R.addLayout(gr)
         root.addLayout(R,1) if False else None  # R_widget added above
 
-    def deploy_pipeline(self,filters,rois,model_path=None):
-        self._pipe_filters=filters; self._pipe_rois=rois; self._pipe_active=bool(rois or filters); self._pipe_model=None
+    def deploy_pipeline(self,filters,model_path=None):
+        self._pipe_filters=filters; self._pipe_active=bool(filters); self._pipe_model=None
         # Invalidate golden cache — filters changed so the pre-filtered golden is stale
         self._golden_bgr_cache = None; self._golden_filter_sig = ()
         if model_path and os.path.exists(model_path) and HAS_YOLO:
             try: self._pipe_model=_YOLO(model_path)
             except: pass
-        self._pipe_lbl.setText(f"Pipeline: {len(filters)} filters | {len(rois)} zones")
+        self._pipe_lbl.setText(f"Pipeline: {len(filters)} filters")
         self._pipe_lbl.setStyleSheet(f"#plbl{{color:{CYAN};font-size:11px;font-family:Consolas;border:none;}}")
         self._update_inspect_btn()
 
@@ -2654,15 +2442,7 @@ class RunTab(QWidget):
         # Apply filter pipeline
         filtered = apply_filters(frame, self._pipe_filters)
 
-        # ── ROI zone checks ───────────────────────────────────────────────
         all_ok = True; roi_disp = []
-        for roi in self._pipe_rois:
-            res = run_roi(filtered, roi, self._pipe_model)
-            passed = res.get("passed", False); info = res.get("info", "")
-            if not passed: all_ok = False
-            self._log.append(f"[{ts}] {'OK' if passed else 'FAIL'} [{roi.zone_type.upper()}] {roi.name}: {info}")
-            roi_disp.append({"name":roi.name,"rect":roi.rect,"type":roi.zone_type,
-                             "passed":passed,"info":info[:20]})
 
         thresh = self._conf.value() / 100
 
@@ -2800,18 +2580,16 @@ class RunTab(QWidget):
                 all_ok = False
 
         self.video.set_detections(live, self._golden, missing_idx)
-        self.video.set_roi_results(roi_disp)
 
         self._total += 1
-        n_defects = len(defects_aoi) + sum(1 for r in roi_disp if not r.get("passed"))
+        n_defects = len(defects_aoi)
         if all_ok:
             self._pass += 1; self.banner.set_pass()
             self._log.append(f"[{ts}] ✔ PASS  ({len(live)} det)")
         else:
             self._fail += 1
             reasons = [d["defect_type"].upper() + " " + d.get("expected_label","")
-                       for d in defects_aoi[:2]] + \
-                      [r.get("info","") for r in roi_disp if not r.get("passed")]
+                       for d in defects_aoi[:2]]
             self.banner.set_fail(reasons[0] if reasons else "FAIL")
             if defects_aoi:
                 types = {}
@@ -2822,7 +2600,7 @@ class RunTab(QWidget):
                 miss_str = f"  MISSING: {', '.join(missing_names[:3])}{'…' if len(missing_names)>3 else ''}"
                 self._log.append(f"[{ts}] ✘ FAIL{miss_str}")
             else:
-                self._log.append(f"[{ts}] ✘ FAIL  ROI check")
+                self._log.append(f"[{ts}] ✘ FAIL")
 
         self._counter_dirty = True
         # Result strip + throughput
@@ -2837,7 +2615,6 @@ class RunTab(QWidget):
             proj  = os.path.basename(self._cfg._path or "")
             mdl   = os.path.basename(self._cfg.get("model_path",""))
             dtypes = ",".join(sorted({d["defect_type"] for d in defects_aoi} |
-                                     {r.get("info","") for r in roi_disp if not r.get("passed")} |
                                      set(missing_names)))
             _db_row_id = self._db.log_result(project=proj, mode="RUN", passed=all_ok,
                                 n_defects=n_defects,
@@ -3964,10 +3741,10 @@ class GoldenTab(QWidget):
 # TAB 3 — LOGIC (Filter Pipeline + ROI)
 # ─────────────────────────────────────────────────────────────────────────────
 class LogicTab(QWidget):
-    pipeline_deployed=Signal(list,list,str)
+    pipeline_deployed=Signal(list,str)
     frame_requested=Signal()   # grab-frame only — does NOT deploy or switch tabs
     def __init__(self,cfg):
-        super().__init__(); self._cfg=cfg; self._filters=[]; self._rois=[]; self._src_frame=None
+        super().__init__(); self._cfg=cfg; self._filters=[]; self._src_frame=None
         self._dirty=False
         self._preview_timer=QTimer(self); self._preview_timer.setSingleShot(True); self._preview_timer.setInterval(120)
         self._preview_timer.timeout.connect(self._preview)
@@ -4014,13 +3791,6 @@ class LogicTab(QWidget):
         self._param_layout=QVBoxLayout(self._param_card); self._param_layout.setContentsMargins(8,8,8,8); self._param_layout.setSpacing(6)
         self._param_layout.addWidget(QLabel("Select a filter to edit parameters."))
         ll.addWidget(self._param_card)
-        # ROI zone widgets kept as non-layout attributes so internal logic still works
-        self._roi_list=QListWidget(); self._roi_list.setObjectName("rlist")
-        self._roi_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._roi_list.currentRowChanged.connect(self._on_roi_sel)
-        self._roi_type=QComboBox()
-        for t in ["yolo","ocr","barcode"]: self._roi_type.addItem(t)
-        self._roi_type.currentTextChanged.connect(self._on_roi_type_change)
         b_frame=QPushButton("Grab Frame from Camera"); b_frame.setFixedHeight(28); b_frame.clicked.connect(self._grab_frame)
         ll.addWidget(b_frame)
         b_dep=QPushButton("▶  DEPLOY PIPELINE"); b_dep.setObjectName("b_dep_logic"); b_dep.setFixedHeight(44)
@@ -4044,20 +3814,17 @@ class LogicTab(QWidget):
         rl.addWidget(sec_lbl("LIVE PREVIEW"))
         # Dual side-by-side view (before / after) ──────────────────────────
         dual=QHBoxLayout(); dual.setSpacing(6); dual.setContentsMargins(0,0,0,0)
-        # Left: ROI canvas (original + zone drawing)
+        # Left: original preview canvas
         bv_wrap=QVBoxLayout(); bv_wrap.setSpacing(2); bv_wrap.setContentsMargins(0,0,0,0)
-        bv_hdr=QLabel("◈  ORIGINAL  (source + ROI zones)")
+        bv_hdr=QLabel("◈  ORIGINAL  (source image)")
         bv_hdr.setStyleSheet(
             f"color:{CYAN};font-size:9px;font-family:Consolas;font-weight:bold;"
             f"letter-spacing:2px;border:none;border-bottom:1px solid {CYAN_DIM};"
             f"padding:0 2px 3px 2px;background:transparent;")
         bv_wrap.addWidget(bv_hdr)
-        self._roi_canvas=ROICanvas()
+        self._roi_canvas=ZoomableImageView()
+        self._roi_canvas._idle_text="ORIGINAL IMAGE\n\nLoad an image or grab a frame\nto view original"
         self._roi_canvas.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Expanding)
-        self._roi_canvas.set_default_type(self._roi_type.currentText())
-        self._roi_canvas.roi_added.connect(self._on_roi_added)
-        self._roi_canvas.roi_modified.connect(self._on_roi_modified)
-        self._roi_canvas.roi_removed.connect(self._on_roi_removed)
         bv_wrap.addWidget(self._roi_canvas,1)
         dual.addLayout(bv_wrap,1)
         # Right: ZoomableImageView (filtered output)
@@ -4074,8 +3841,8 @@ class LogicTab(QWidget):
         dual.addLayout(av_wrap,1)
         rl.addLayout(dual,1)
         # Link zoom peers so wheel/pan on either view syncs the other
-        self._roi_canvas._peer_ziv = self._prev_view
-        self._prev_view._canvas_peer = self._roi_canvas
+        self._roi_canvas._peer = self._prev_view
+        self._prev_view._peer = self._roi_canvas
         # Controls bar
         br=QHBoxLayout(); br.setContentsMargins(0,0,0,0); br.setSpacing(4)
         b_img=QPushButton("Load Image"); b_img.setFixedHeight(28); b_img.clicked.connect(self._load_img)
@@ -4174,50 +3941,7 @@ class LogicTab(QWidget):
             self._filters[i].enabled=not self._filters[i].enabled; self._refresh_filter_list()
             self._mark_pipeline_dirty(); self._queue_live_preview()
 
-    def _on_roi_added(self,roi):
-        item=QListWidgetItem(f"[{roi.zone_type.upper()}] {roi.name}")
-        item.setForeground(QColor(CYAN)); self._roi_list.addItem(item); self._rois.append(roi)
-        self._roi_list.setCurrentRow(len(self._rois)-1)
-        self._mark_pipeline_dirty()
 
-    def _on_roi_modified(self,roi):
-        self._refresh_roi_list(); self._mark_pipeline_dirty()
-
-    def _on_roi_removed(self,roi):
-        """Called when user right-clicks to delete a zone directly on the canvas."""
-        if roi in self._rois:
-            self._rois.remove(roi)
-        self._refresh_roi_list()
-        self._mark_pipeline_dirty()
-
-    def _refresh_roi_list(self):
-        self._roi_list.clear()
-        for roi in self._rois:
-            item=QListWidgetItem(f"[{roi.zone_type.upper()}] {roi.name}")
-            col={"ocr":QColor(GREEN),"barcode":QColor(PURPLE)}.get(roi.zone_type,QColor(CYAN))
-            item.setForeground(col); self._roi_list.addItem(item)
-
-    def _on_roi_sel(self,i):
-        if 0<=i<len(self._rois):
-            roi=self._rois[i]
-            idx=self._roi_type.findText(roi.zone_type)
-            if idx>=0:
-                self._roi_type.blockSignals(True); self._roi_type.setCurrentIndex(idx); self._roi_type.blockSignals(False)
-
-    def _on_roi_type_change(self,t):
-        self._roi_canvas.set_default_type(t)
-        i=self._roi_list.currentRow()
-        if 0<=i<len(self._rois):
-            self._rois[i].zone_type=t; self._roi_canvas.set_selected_type(t); self._refresh_roi_list()
-            self._mark_pipeline_dirty()
-
-    def _roi_rm(self):
-        i=self._roi_list.currentRow()
-        if 0<=i<len(self._rois):
-            roi=self._rois.pop(i)
-            if roi in self._roi_canvas.rois: self._roi_canvas.rois.remove(roi)
-            self._roi_canvas.update(); self._refresh_roi_list()
-            self._mark_pipeline_dirty()
 
     def _grab_frame(self):
         # Emit a lightweight signal — MainWindow handles the frame fetch.
@@ -4251,16 +3975,15 @@ class LogicTab(QWidget):
 
     def _deploy(self):
         mp=self._cfg.get("model_path") or ""
-        self._dep_lbl.setText(f"Deployed: {len(self._filters)} filters | {len(self._rois)} ROI zones")
+        self._dep_lbl.setText(f"Deployed: {len(self._filters)} filters")
         self._dep_lbl.setStyleSheet(f"#dlog_lbl{{color:{GREEN};font-size:11px;border:none;}}")
-        self.pipeline_deployed.emit(list(self._filters),list(self._rois),mp)
+        self.pipeline_deployed.emit(list(self._filters),mp)
 
     def on_project_changed(self,path):
         saved=os.path.join(path,"pipeline.json")
         self._save_timer.stop(); self._dirty=False
         if not os.path.exists(saved):
-            self._filters=[]; self._rois=[]; self._refresh_filter_list(); self._refresh_roi_list()
-            self._roi_canvas.rois=[]; self._roi_canvas.update()
+            self._filters=[]; self._refresh_filter_list()
             self._update_save_status("No saved pipeline",TEXT_DIM)
             return
         try:
@@ -4271,18 +3994,13 @@ class LogicTab(QWidget):
                 if cls:
                     n=cls(); n.params=fc.get("params",n.params); n.enabled=fc.get("enabled",True); self._filters.append(n)
             self._refresh_filter_list()
-            self._rois=[]
-            for rc in cfg.get("rois",[]):
-                name=rc.get("name","Zone"); zt=rc.get("type","yolo"); rect=rc.get("rect",[0,0,60,60])
-                rz=ROIZone(name,zt,rect); rz.enabled=rc.get("enabled",True); self._rois.append(rz)
-            self._refresh_roi_list(); self._roi_canvas.rois=list(self._rois); self._roi_canvas.update()
             self._update_save_status("Loaded pipeline",GREEN)
         except Exception as e:
             self._update_save_status(f"Load failed: {e}",RED)
         self._queue_live_preview()
 
     def save_pipeline(self,path):
-        cfg={"filters":[f.get_config() for f in self._filters],"rois":[r.get_config() for r in self._rois]}
+        cfg={"filters":[f.get_config() for f in self._filters]}
         try:
             with open(os.path.join(path,"pipeline.json"),"w") as f: json.dump(cfg,f,indent=2)
             return True,""
@@ -5861,7 +5579,6 @@ class ZoomableImageView(QWidget):
         # Peer-sync support: set both views' _peer to each other to sync zoom/pan
         self._peer         = None
         self._sync_blocked = False
-        self._canvas_peer  = None   # optional ROICanvas to keep in sync
         self._fit_zoom     = 1.0    # zoom level at last _fit() — used for sync ratio
         self._idle_text    = "No image loaded"   # override per instance if needed
 
@@ -5885,6 +5602,17 @@ class ZoomableImageView(QWidget):
 
     def load_pixmap(self, px: QPixmap):
         self._px = px; self._fit()
+
+    def load_frame(self, bgr):
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        qimg = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
+        self._px = QPixmap.fromImage(qimg)
+        self._fit()
+
+    def load_image(self, path):
+        self._px = QPixmap(path)
+        self._fit()
 
     def clear(self):
         self._px = QPixmap(); self.update()
@@ -5964,9 +5692,6 @@ class ZoomableImageView(QWidget):
         """Push current zoom/pan state to peer (if any)."""
         if self._peer and not self._sync_blocked:
             self._peer._sync_from(self._zoom, self._offset)
-        if self._canvas_peer and not self._sync_blocked:
-            self._canvas_peer.sync_from_ziv(
-                self._zoom, self._offset, self._fit_zoom)
 
     def zoom_to_component(self, cx_norm: float, cy_norm: float,
                            w_norm: float, h_norm: float):
@@ -6073,8 +5798,7 @@ class OfflineAOIThread(QThread):
     def __init__(self, golden_path: str, test_paths: list,
                  model_path: str, conf: float,
                  use_sahi: bool, cal_runs: int,
-                 filters: list = None, rois: list = None,
-                 pipe_model=None):
+                 filters: list = None):
         super().__init__()
         self._golden_path = golden_path
         self._test_paths  = list(test_paths)
@@ -6083,8 +5807,6 @@ class OfflineAOIThread(QThread):
         self._use_sahi    = use_sahi
         self._cal_runs    = cal_runs
         self._filters     = filters or []
-        self._rois        = rois or []
-        self._pipe_model  = pipe_model   # pre-built ROI YOLO model
         self._abort       = False
 
     def abort(self): self._abort = True
@@ -6212,12 +5934,6 @@ class OfflineAOIThread(QThread):
 
             # ROI zones
             roi_results = []; roi_fail = False
-            for roi in self._rois:
-                res = run_roi(proc_img, roi, self._pipe_model)
-                if not res.get('passed'): roi_fail = True
-                roi_results.append({'name':roi.name,'type':roi.zone_type,
-                                    'passed':res.get('passed',False),
-                                    'info':res.get('info','')})
 
             # YOLO inference on test board
             ti = _t.time()
@@ -6244,12 +5960,6 @@ class OfflineAOIThread(QThread):
             defects, board_match = _aoi_check_board(golden_dets, golden_img, proc_img,
                                         dets, pos_tol, per_thr, poly_mult,
                                         match_radius=match_r)
-            if roi_fail:
-                for rr in roi_results:
-                    if not rr['passed']:
-                        defects.append({'component_id':-1,'defect_type':'roi_fail',
-                            'expected_label':rr['name'],'found_label':rr['type'],
-                            'details':f"ROI {rr['name']}: {rr['info']}"})
 
             _DS = {"missing":"MISSING","wrong_component":"WRONG PART",
                    "misaligned":"MISALIGNED","wrong_polarity":"WRONG POLARITY",
@@ -6339,8 +6049,6 @@ class OfflineAOITab(QWidget):
         self._golden_rendered = False  # render annotated golden once per run
         # Pipeline state (received from LogicTab)
         self._pipe_filters  = []
-        self._pipe_rois     = []
-        self._pipe_model    = None
         self._pipe_active   = False
         self._db = None   # set by MainWindow after creation
         self._build()
@@ -6879,15 +6587,10 @@ class OfflineAOITab(QWidget):
 
     # ── Slots ────────────────────────────────────────────────────────────────
 
-    def deploy_pipeline(self, filters, rois, model_path=""):
+    def deploy_pipeline(self, filters, model_path=""):
         """Receive pipeline from LogicTab (same signal as RunTab)."""
         self._pipe_filters = list(filters)
-        self._pipe_rois    = list(rois)
-        self._pipe_model   = None
-        self._pipe_active  = bool(filters or rois)
-        if model_path and os.path.exists(model_path) and HAS_YOLO:
-            try: self._pipe_model = _YOLO(model_path)
-            except: pass
+        self._pipe_active  = bool(filters)
         self._refresh_pipe_status()
 
     def _use_logic_pipeline(self):
@@ -6897,19 +6600,13 @@ class OfflineAOITab(QWidget):
         if hasattr(mw, '_logic'):
             lt = mw._logic
             self._pipe_filters = list(lt._filters)
-            self._pipe_rois    = list(lt._rois)
-            self._pipe_active  = bool(self._pipe_filters or self._pipe_rois)
-            self._pipe_model   = None
-            mp = mw._cfg.get("model_path") or ""
-            if mp and os.path.exists(mp) and HAS_YOLO:
-                try: self._pipe_model = _YOLO(mp)
-                except: pass
+            self._pipe_active  = bool(self._pipe_filters)
             self._refresh_pipe_status()
         else:
             self._pipe_status_lbl.setText("Logic tab not found")
 
     def _clear_pipeline(self):
-        self._pipe_filters=[]; self._pipe_rois=[]; self._pipe_model=None; self._pipe_active=False
+        self._pipe_filters=[]; self._pipe_active=False
         self._refresh_pipe_status()
 
     def _refresh_pipe_status(self):
@@ -6917,8 +6614,8 @@ class OfflineAOITab(QWidget):
             self._pipe_status_lbl.setText("No pipeline")
             self._pipe_status_lbl.setStyleSheet(f"#aoi_pipe_lbl{{color:{TEXT_SEC};font-size:10px;font-family:Consolas;border:none;}}")
         else:
-            nf=len(self._pipe_filters); nr=len(self._pipe_rois)
-            self._pipe_status_lbl.setText(f"Active: {nf} filters | {nr} ROI zones")
+            nf=len(self._pipe_filters)
+            self._pipe_status_lbl.setText(f"Active: {nf} filters")
             self._pipe_status_lbl.setStyleSheet(f"#aoi_pipe_lbl{{color:{CYAN};font-size:10px;font-family:Consolas;border:none;}}")
 
 
@@ -7011,8 +6708,6 @@ class OfflineAOITab(QWidget):
             use_sahi    = self._sahi_cb.isChecked(),
             cal_runs    = self._cal_spin.value(),
             filters     = self._pipe_filters if self._pipe_active else [],
-            rois        = self._pipe_rois    if self._pipe_active else [],
-            pipe_model  = self._pipe_model,
         )
         self._worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
         self._worker.board_done.connect(self._on_board_done, Qt.ConnectionType.QueuedConnection)
@@ -8626,13 +8321,13 @@ class MainWindow(QMainWindow):
         if not path or not os.path.isdir(path): return
         self._cfg.load(path); self._on_project_opened(path)
 
-    def _on_pipeline(self,filters,rois,model_path):
-        self._run.deploy_pipeline(filters,rois,model_path)
+    def _on_pipeline(self,filters,model_path):
+        self._run.deploy_pipeline(filters,model_path)
         frame=self._run.get_latest_frame()
         if frame is not None: self._logic.set_src_frame(frame)
-        self._syslog.append(f"Pipeline deployed: {len(filters)} filters | {len(rois)} ROI zones")
+        self._syslog.append(f"Pipeline deployed: {len(filters)} filters")
         self._switch(0)
-        ToastManager.show(self, f"Pipeline deployed — {len(filters)} filters, {len(rois)} zones", "success")
+        ToastManager.show(self, f"Pipeline deployed — {len(filters)} filters", "success")
 
     def _on_frame_requested(self):
         """Grab Frame from Camera in LogicTab — no deploy, no tab switch.

@@ -39,10 +39,10 @@ from ..utils import (
 )
 from ..threads import CameraThread
 from ..filters import (
-    FilterNode, FILTER_REGISTRY, apply_filters, AutoCalibrateWorker, run_roi
+    FilterNode, FILTER_REGISTRY, apply_filters, AutoCalibrateWorker
 )
 from ..widgets import (
-    FastLog, ROICanvas, ROIZone, StatCard, ToastManager, VideoWidget,
+    FastLog, StatCard, ToastManager, VideoWidget,
     ZoomableImageView
 )
 
@@ -53,10 +53,10 @@ if HAS_NP:
 
 
 class LogicTab(QWidget):
-    pipeline_deployed=Signal(list,list,str)
+    pipeline_deployed=Signal(list,str)
     frame_requested=Signal()   # grab-frame only — does NOT deploy or switch tabs
     def __init__(self,cfg):
-        super().__init__(); self._cfg=cfg; self._filters=[]; self._rois=[]; self._src_frame=None
+        super().__init__(); self._cfg=cfg; self._filters=[]; self._src_frame=None
         self._dirty=False
         self._preview_timer=QTimer(self); self._preview_timer.setSingleShot(True); self._preview_timer.setInterval(120)
         self._preview_timer.timeout.connect(self._preview)
@@ -103,13 +103,6 @@ class LogicTab(QWidget):
         self._param_layout=QVBoxLayout(self._param_card); self._param_layout.setContentsMargins(8,8,8,8); self._param_layout.setSpacing(6)
         self._param_layout.addWidget(QLabel("Select a filter to edit parameters."))
         ll.addWidget(self._param_card)
-        # ROI zone widgets kept as non-layout attributes so internal logic still works
-        self._roi_list=QListWidget(); self._roi_list.setObjectName("rlist")
-        self._roi_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._roi_list.currentRowChanged.connect(self._on_roi_sel)
-        self._roi_type=QComboBox()
-        for t in ["yolo","ocr","barcode"]: self._roi_type.addItem(t)
-        self._roi_type.currentTextChanged.connect(self._on_roi_type_change)
         b_frame=QPushButton("Grab Frame from Camera"); b_frame.setFixedHeight(28); b_frame.clicked.connect(self._grab_frame)
         ll.addWidget(b_frame)
         b_dep=QPushButton("▶  DEPLOY PIPELINE"); b_dep.setObjectName("b_dep_logic"); b_dep.setFixedHeight(44)
@@ -133,20 +126,17 @@ class LogicTab(QWidget):
         rl.addWidget(sec_lbl("LIVE PREVIEW"))
         # Dual side-by-side view (before / after) ──────────────────────────
         dual=QHBoxLayout(); dual.setSpacing(6); dual.setContentsMargins(0,0,0,0)
-        # Left: ROI canvas (original + zone drawing)
+        # Left: original preview canvas
         bv_wrap=QVBoxLayout(); bv_wrap.setSpacing(2); bv_wrap.setContentsMargins(0,0,0,0)
-        bv_hdr=QLabel("◈  ORIGINAL  (source + ROI zones)")
+        bv_hdr=QLabel("◈  ORIGINAL  (source image)")
         bv_hdr.setStyleSheet(
             f"color:{CYAN};font-size:9px;font-family:Consolas;font-weight:bold;"
             f"letter-spacing:2px;border:none;border-bottom:1px solid {CYAN_DIM};"
             f"padding:0 2px 3px 2px;background:transparent;")
         bv_wrap.addWidget(bv_hdr)
-        self._roi_canvas=ROICanvas()
+        self._roi_canvas=ZoomableImageView()
+        self._roi_canvas._idle_text="ORIGINAL IMAGE\n\nLoad an image or grab a frame\nto view original"
         self._roi_canvas.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Expanding)
-        self._roi_canvas.set_default_type(self._roi_type.currentText())
-        self._roi_canvas.roi_added.connect(self._on_roi_added)
-        self._roi_canvas.roi_modified.connect(self._on_roi_modified)
-        self._roi_canvas.roi_removed.connect(self._on_roi_removed)
         bv_wrap.addWidget(self._roi_canvas,1)
         dual.addLayout(bv_wrap,1)
         # Right: ZoomableImageView (filtered output)
@@ -163,8 +153,8 @@ class LogicTab(QWidget):
         dual.addLayout(av_wrap,1)
         rl.addLayout(dual,1)
         # Link zoom peers so wheel/pan on either view syncs the other
-        self._roi_canvas._peer_ziv = self._prev_view
-        self._prev_view._canvas_peer = self._roi_canvas
+        self._roi_canvas._peer = self._prev_view
+        self._prev_view._peer = self._roi_canvas
         # Controls bar
         br=QHBoxLayout(); br.setContentsMargins(0,0,0,0); br.setSpacing(4)
         b_img=QPushButton("Load Image"); b_img.setFixedHeight(28); b_img.clicked.connect(self._load_img)
@@ -263,50 +253,7 @@ class LogicTab(QWidget):
             self._filters[i].enabled=not self._filters[i].enabled; self._refresh_filter_list()
             self._mark_pipeline_dirty(); self._queue_live_preview()
 
-    def _on_roi_added(self,roi):
-        item=QListWidgetItem(f"[{roi.zone_type.upper()}] {roi.name}")
-        item.setForeground(QColor(CYAN)); self._roi_list.addItem(item); self._rois.append(roi)
-        self._roi_list.setCurrentRow(len(self._rois)-1)
-        self._mark_pipeline_dirty()
 
-    def _on_roi_modified(self,roi):
-        self._refresh_roi_list(); self._mark_pipeline_dirty()
-
-    def _on_roi_removed(self,roi):
-        """Called when user right-clicks to delete a zone directly on the canvas."""
-        if roi in self._rois:
-            self._rois.remove(roi)
-        self._refresh_roi_list()
-        self._mark_pipeline_dirty()
-
-    def _refresh_roi_list(self):
-        self._roi_list.clear()
-        for roi in self._rois:
-            item=QListWidgetItem(f"[{roi.zone_type.upper()}] {roi.name}")
-            col={"ocr":QColor(GREEN),"barcode":QColor(PURPLE)}.get(roi.zone_type,QColor(CYAN))
-            item.setForeground(col); self._roi_list.addItem(item)
-
-    def _on_roi_sel(self,i):
-        if 0<=i<len(self._rois):
-            roi=self._rois[i]
-            idx=self._roi_type.findText(roi.zone_type)
-            if idx>=0:
-                self._roi_type.blockSignals(True); self._roi_type.setCurrentIndex(idx); self._roi_type.blockSignals(False)
-
-    def _on_roi_type_change(self,t):
-        self._roi_canvas.set_default_type(t)
-        i=self._roi_list.currentRow()
-        if 0<=i<len(self._rois):
-            self._rois[i].zone_type=t; self._roi_canvas.set_selected_type(t); self._refresh_roi_list()
-            self._mark_pipeline_dirty()
-
-    def _roi_rm(self):
-        i=self._roi_list.currentRow()
-        if 0<=i<len(self._rois):
-            roi=self._rois.pop(i)
-            if roi in self._roi_canvas.rois: self._roi_canvas.rois.remove(roi)
-            self._roi_canvas.update(); self._refresh_roi_list()
-            self._mark_pipeline_dirty()
 
     def _grab_frame(self):
         # Emit a lightweight signal — MainWindow handles the frame fetch.
@@ -340,16 +287,15 @@ class LogicTab(QWidget):
 
     def _deploy(self):
         mp=self._cfg.get("model_path") or ""
-        self._dep_lbl.setText(f"Deployed: {len(self._filters)} filters | {len(self._rois)} ROI zones")
+        self._dep_lbl.setText(f"Deployed: {len(self._filters)} filters")
         self._dep_lbl.setStyleSheet(f"#dlog_lbl{{color:{GREEN};font-size:11px;border:none;}}")
-        self.pipeline_deployed.emit(list(self._filters),list(self._rois),mp)
+        self.pipeline_deployed.emit(list(self._filters),mp)
 
     def on_project_changed(self,path):
         saved=os.path.join(path,"pipeline.json")
         self._save_timer.stop(); self._dirty=False
         if not os.path.exists(saved):
-            self._filters=[]; self._rois=[]; self._refresh_filter_list(); self._refresh_roi_list()
-            self._roi_canvas.rois=[]; self._roi_canvas.update()
+            self._filters=[]; self._refresh_filter_list()
             self._update_save_status("No saved pipeline",TEXT_DIM)
             return
         try:
@@ -360,18 +306,13 @@ class LogicTab(QWidget):
                 if cls:
                     n=cls(); n.params=fc.get("params",n.params); n.enabled=fc.get("enabled",True); self._filters.append(n)
             self._refresh_filter_list()
-            self._rois=[]
-            for rc in cfg.get("rois",[]):
-                name=rc.get("name","Zone"); zt=rc.get("type","yolo"); rect=rc.get("rect",[0,0,60,60])
-                rz=ROIZone(name,zt,rect); rz.enabled=rc.get("enabled",True); self._rois.append(rz)
-            self._refresh_roi_list(); self._roi_canvas.rois=list(self._rois); self._roi_canvas.update()
             self._update_save_status("Loaded pipeline",GREEN)
         except Exception as e:
             self._update_save_status(f"Load failed: {e}",RED)
         self._queue_live_preview()
 
     def save_pipeline(self,path):
-        cfg={"filters":[f.get_config() for f in self._filters],"rois":[r.get_config() for r in self._rois]}
+        cfg={"filters":[f.get_config() for f in self._filters]}
         try:
             with open(os.path.join(path,"pipeline.json"),"w") as f: json.dump(cfg,f,indent=2)
             return True,""

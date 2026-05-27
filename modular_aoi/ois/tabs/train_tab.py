@@ -1,7 +1,6 @@
 """
 train_tab.py — Golden board management & training tab (GoldenTab).
 """
-import glob
 import json
 import os
 import platform

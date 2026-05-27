@@ -13,8 +13,7 @@ if __package__ in (None, ""):
     __package__ = "ois"
 
 from PySide6.QtCore import QThread, Signal
-
-from .utils import HAS_CV2, HAS_NP, HAS_YOLO, HAS_OCR, HAS_ZBAR, safe_predict
+from .utils import HAS_CV2, HAS_NP, HAS_YOLO, safe_predict
 
 if HAS_CV2:
     import cv2
@@ -22,10 +21,6 @@ if HAS_NP:
     import numpy as np
 if HAS_YOLO:
     from ultralytics import YOLO as _YOLO
-if HAS_OCR:
-    import pytesseract
-if HAS_ZBAR:
-    from pyzbar import pyzbar
 
 
 # ── Filter nodes ─────────────────────────────────────────────────────────────
@@ -591,27 +586,4 @@ class AutoCalibrateWorker(QThread):
             self.done.emit(None, f"Calibration error: {e}")
 
 
-# ── run_roi ──────────────────────────────────────────────────────────────────
 
-def run_roi(img,roi,model=None):
-    x,y,rw,rh=roi.rect; ih,iw=img.shape[:2]
-    x1,y1=max(0,x),max(0,y); x2,y2=min(iw,x+rw),min(ih,y+rh)
-    if x2<=x1 or y2<=y1: return {"passed":False,"info":"bad crop"}
-    crop=img[y1:y2,x1:x2]
-    if roi.zone_type=="yolo":
-        if model is None: return {"passed":False,"info":"no model"}
-        try: res=safe_predict(model, crop, conf=0.25, iou=0.35, imgsz=640, verbose=False, device='cpu')[0]; n=len(res.boxes); return {"passed":n>0,"info":f"{n} obj"}
-
-        except Exception as e: return {"passed":False,"info":str(e)[:20]}
-    elif roi.zone_type=="ocr":
-        if not HAS_OCR: return {"passed":False,"info":"no pytesseract"}
-        try: t=pytesseract.image_to_string(crop,config="--psm 7").strip(); return {"passed":bool(t),"info":t[:20] or "empty"}
-        except Exception as e: return {"passed":False,"info":str(e)[:20]}
-    elif roi.zone_type=="barcode":
-        if not HAS_ZBAR: return {"passed":False,"info":"no pyzbar"}
-        try:
-            codes=pyzbar.decode(crop)
-            if codes: return {"passed":True,"info":f"{codes[0].type}:{codes[0].data.decode()[:12]}"}
-            return {"passed":False,"info":"no barcode"}
-        except Exception as e: return {"passed":False,"info":str(e)[:20]}
-    return {"passed":False,"info":"unknown type"}

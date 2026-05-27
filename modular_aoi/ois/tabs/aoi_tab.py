@@ -44,9 +44,9 @@ from ..utils import (
     build_golden_dataset, OG_MODEL, calc_iou, match_detections
 )
 from ..aoi_engine import OfflineAOIThread, _DEFECT_COLOURS
-from ..filters import apply_filters, FILTER_REGISTRY, FilterNode, run_roi
+from ..filters import apply_filters, FILTER_REGISTRY, FilterNode
 from ..widgets import (
-    FastLog, ResultStrip, ROICanvas, ROIZone, StatCard, ToastManager,
+    FastLog, ResultStrip, StatCard, ToastManager,
     ZoomableImageView
 )
 
@@ -75,7 +75,6 @@ class OfflineAOITab(QWidget):
         self._golden_rendered = False  # render annotated golden once per run
         # Pipeline state (received from LogicTab)
         self._pipe_filters  = []
-        self._pipe_rois     = []
         self._pipe_model    = None
         self._pipe_active   = False
         self._db = None   # set by MainWindow after creation
@@ -615,12 +614,11 @@ class OfflineAOITab(QWidget):
 
     # ── Slots ────────────────────────────────────────────────────────────────
 
-    def deploy_pipeline(self, filters, rois, model_path=""):
+    def deploy_pipeline(self, filters, model_path=""):
         """Receive pipeline from LogicTab (same signal as RunTab)."""
         self._pipe_filters = list(filters)
-        self._pipe_rois    = list(rois)
         self._pipe_model   = None
-        self._pipe_active  = bool(filters or rois)
+        self._pipe_active  = bool(filters)
         if model_path and os.path.exists(model_path) and HAS_YOLO:
             try: self._pipe_model = _YOLO(model_path)
             except: pass
@@ -633,8 +631,7 @@ class OfflineAOITab(QWidget):
         if hasattr(mw, '_logic'):
             lt = mw._logic
             self._pipe_filters = list(lt._filters)
-            self._pipe_rois    = list(lt._rois)
-            self._pipe_active  = bool(self._pipe_filters or self._pipe_rois)
+            self._pipe_active  = bool(self._pipe_filters)
             self._pipe_model   = None
             mp = mw._cfg.get("model_path") or ""
             if mp and os.path.exists(mp) and HAS_YOLO:
@@ -645,7 +642,7 @@ class OfflineAOITab(QWidget):
             self._pipe_status_lbl.setText("Logic tab not found")
 
     def _clear_pipeline(self):
-        self._pipe_filters=[]; self._pipe_rois=[]; self._pipe_model=None; self._pipe_active=False
+        self._pipe_filters=[]; self._pipe_model=None; self._pipe_active=False
         self._refresh_pipe_status()
 
     def _refresh_pipe_status(self):
@@ -653,8 +650,8 @@ class OfflineAOITab(QWidget):
             self._pipe_status_lbl.setText("No pipeline")
             self._pipe_status_lbl.setStyleSheet(f"#aoi_pipe_lbl{{color:{TEXT_SEC};font-size:10px;font-family:Consolas;border:none;}}")
         else:
-            nf=len(self._pipe_filters); nr=len(self._pipe_rois)
-            self._pipe_status_lbl.setText(f"Active: {nf} filters | {nr} ROI zones")
+            nf=len(self._pipe_filters)
+            self._pipe_status_lbl.setText(f"Active: {nf} filters")
             self._pipe_status_lbl.setStyleSheet(f"#aoi_pipe_lbl{{color:{CYAN};font-size:10px;font-family:Consolas;border:none;}}")
 
 
@@ -747,8 +744,6 @@ class OfflineAOITab(QWidget):
             use_sahi    = self._sahi_cb.isChecked(),
             cal_runs    = self._cal_spin.value(),
             filters     = self._pipe_filters if self._pipe_active else [],
-            rois        = self._pipe_rois    if self._pipe_active else [],
-            pipe_model  = self._pipe_model,
         )
         self._worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
         self._worker.board_done.connect(self._on_board_done, Qt.ConnectionType.QueuedConnection)

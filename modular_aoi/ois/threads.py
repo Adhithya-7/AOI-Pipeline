@@ -73,10 +73,9 @@ from .filters import apply_filters
 
 class InferenceThread(QThread):
     result_ready=Signal(list,float); log=Signal(str)
-    def __init__(self,cfg,cam,filters=None,rois=None):
+    def __init__(self,cfg,cam,filters=None):
         super().__init__(); self._cfg=cfg; self._cam=cam; self._stop=False; self._model=None
         self._filters = filters or []
-        self._rois = rois or []
         self._fps_times: deque = deque(maxlen=20)  # ~2 s window at 8 fps
         self._debug_counter = 0
 
