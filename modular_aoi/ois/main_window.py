@@ -434,9 +434,9 @@ class MainWindow(QMainWindow):
         self._run.deploy_pipeline(filters,model_path)
         frame=self._run.get_latest_frame()
         if frame is not None: self._logic.set_src_frame(frame)
-        self._syslog.append(f"Pipeline deployed: {len(filters)} filters")
+        self._syslog.append(f"Filters deployed: {len(filters)} active")
         self._switch(0)
-        ToastManager.show(self, f"Pipeline deployed — {len(filters)} filters", "success")
+        ToastManager.show(self, f"Filters deployed — {len(filters)} active", "success")
 
     def _on_frame_requested(self):
         """Grab Frame from Camera in LogicTab — no deploy, no tab switch.

@@ -839,11 +839,39 @@ class SettingsDialog(QDialog):
         form.addStretch()
         scroll.setWidget(inner); lay.addWidget(scroll, 1)
 
+        from PySide6.QtWidgets import QMessageBox
+        
+        btn_row = QHBoxLayout()
+        reset_btn = QPushButton("Reset to Defaults")
+        reset_btn.setStyleSheet(f"color:red; border:1px solid #660000; border-radius:4px; padding:4px 8px;")
+        def _reset_defaults():
+            if QMessageBox.question(self, "Reset Settings", "Reset all settings to default values?") == QMessageBox.StandardButton.Yes:
+                self._cam_idx.setValue(0)
+                self._conf.setValue(0.25)
+                self._autolbl_conf.setValue(0.50)
+                self._aoi_conf.setValue(0.25)
+                self._iou.setValue(0.30)
+                self._persist.setValue(5)
+                self._max_w.setValue(0.30)
+                self._max_h.setValue(0.30)
+                self._edge.setValue(10)
+                self._aoi_cal.setValue(8)
+                self._autosave_cb.setChecked(True)
+                self._log_history_cb.setChecked(True)
+                self._save_annot_cb.setChecked(True)
+                self._pcb_desat.setValue(0.70)
+                self._pcb_boost.setValue(1.30)
+        reset_btn.clicked.connect(_reset_defaults)
+        
         bbox = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                 QDialogButtonBox.StandardButton.Cancel)
         bbox.accepted.connect(self._accept)
         bbox.rejected.connect(self.reject)
-        lay.addWidget(bbox)
+        
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(bbox)
+        lay.addLayout(btn_row)
 
     def _accept(self):
         c = self._cfg

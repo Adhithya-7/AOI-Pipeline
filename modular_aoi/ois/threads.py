@@ -28,12 +28,18 @@ if HAS_YOLO:
     from ultralytics import YOLO as _YOLO
 
 
+from .filters import apply_filters
+
 class CameraThread(QThread):
     frame_ready=Signal(QImage); error=Signal(str)
     DISP_W=960; DISP_FPS=30; INFER_FPS=15
     def __init__(self,idx=0):
         super().__init__(); self._idx=idx; self._stop=False
         self._infer_frame=None; self._small_bgr=None; self._mx=QMutex()
+        self._filters = []
+    def set_filters(self, filters):
+        with QMutexLocker(self._mx):
+            self._filters = list(filters)
     def get_infer_frame(self):
         with QMutexLocker(self._mx): f=self._infer_frame; self._infer_frame=None; return f
     def get_small_bgr(self):
@@ -57,7 +63,10 @@ class CameraThread(QThread):
                 last_disp=now
                 h,w=frame.shape[:2]; scale=self.DISP_W/w
                 small=cv2.resize(frame,(int(w*scale),int(h*scale)),interpolation=cv2.INTER_NEAREST)
-                with QMutexLocker(self._mx): self._small_bgr=small
+                with QMutexLocker(self._mx):
+                    self._small_bgr=small
+                    if self._filters:
+                        small = apply_filters(small, self._filters)
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 nw, nh = rgb.shape[1], rgb.shape[0]
                 # bytes() creates a Python-owned copy of the buffer so QImage
@@ -69,7 +78,6 @@ class CameraThread(QThread):
         cap.release()
     def stop(self): self._stop=True; self.wait(2000)
 
-from .filters import apply_filters
 
 class InferenceThread(QThread):
     result_ready=Signal(list,float); log=Signal(str)
@@ -78,6 +86,9 @@ class InferenceThread(QThread):
         self._filters = filters or []
         self._fps_times: deque = deque(maxlen=20)  # ~2 s window at 8 fps
         self._debug_counter = 0
+
+    def set_filters(self, filters):
+        self._filters = list(filters)
 
     def run(self):
         if not self._load_model(): return

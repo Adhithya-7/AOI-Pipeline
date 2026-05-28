@@ -738,6 +738,10 @@ class CameraThread(QThread):
     def __init__(self,idx=0):
         super().__init__(); self._idx=idx; self._stop=False
         self._infer_frame=None; self._small_bgr=None; self._mx=QMutex()
+        self._filters = []
+    def set_filters(self, filters):
+        with QMutexLocker(self._mx):
+            self._filters = list(filters)
     def get_infer_frame(self):
         with QMutexLocker(self._mx): f=self._infer_frame; self._infer_frame=None; return f
     def get_small_bgr(self):
@@ -761,7 +765,10 @@ class CameraThread(QThread):
                 last_disp=now
                 h,w=frame.shape[:2]; scale=self.DISP_W/w
                 small=cv2.resize(frame,(int(w*scale),int(h*scale)),interpolation=cv2.INTER_NEAREST)
-                with QMutexLocker(self._mx): self._small_bgr=small
+                with QMutexLocker(self._mx):
+                    self._small_bgr=small
+                    if self._filters:
+                        small = apply_filters(small, self._filters)
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 nw, nh = rgb.shape[1], rgb.shape[0]
                 # bytes() creates a Python-owned copy of the buffer so QImage
@@ -777,7 +784,10 @@ class InferenceThread(QThread):
     result_ready=Signal(list,float); log=Signal(str)
     def __init__(self,cfg,cam):
         super().__init__(); self._cfg=cfg; self._cam=cam; self._stop=False; self._model=None
+        self._filters = []
         self._fps_times: deque = deque(maxlen=20)  # ~2 s window at 8 fps
+    def set_filters(self, filters):
+        self._filters = list(filters)
     def run(self):
         if not self._load_model(): return
         TARGET=1.0/8.0   # 8fps inference
@@ -785,7 +795,14 @@ class InferenceThread(QThread):
             t0=time.time()
             frame=self._cam.get_infer_frame()
             if frame is None: time.sleep(0.020); continue
-            dets,lat=self._infer(frame)
+            
+            # Apply active filters if any
+            if self._filters:
+                proc_img = apply_filters(frame, self._filters)
+            else:
+                proc_img = frame
+                
+            dets,lat=self._infer(proc_img)
             # Track actual FPS (deque handles size limit automatically)
             now=time.time(); self._fps_times.append(now)
             self.result_ready.emit(dets,lat)
@@ -2210,6 +2227,77 @@ class ProjectDialog(QDialog):
         self.project_opened.emit(path); self._refresh()
 
 
+class MasterUploadDialog(QDialog):
+    def __init__(self, camera_active, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Golden Master Setup")
+        self.setMinimumSize(420, 240)
+        self.setStyleSheet(f"background:{BG_CARD};border:1px solid {BG_BORDER2};border-radius:8px;")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(12)
+        
+        lbl_hdr = sec_lbl("GOLDEN MASTER SETUP")
+        lay.addWidget(lbl_hdr)
+        
+        lbl_desc = QLabel("Select how you would like to set the Golden Master reference board and components list:")
+        lbl_desc.setWordWrap(True)
+        lbl_desc.setStyleSheet(f"color:{TEXT_SEC};font-size:11px;border:none;")
+        lay.addWidget(lbl_desc)
+        
+        self.choice = None
+        
+        # 1. Choose Picture (from disk)
+        b_pic = QPushButton("🖼️  Choose Picture (from disk)")
+        b_pic.setFixedHeight(36)
+        b_pic.setStyleSheet(
+            f"QPushButton{{background:{BG_CARD};color:{CYAN};border:1px solid {CYAN}66;border-radius:6px;font-size:11px;font-weight:bold;text-align:left;padding-left:14px;}}"
+            f"QPushButton:hover{{background:{CYAN}22;border-color:{CYAN};}}"
+        )
+        b_pic.clicked.connect(lambda: self._select("picture"))
+        lay.addWidget(b_pic)
+        
+        # 2. Upload JSON (components list)
+        b_json = QPushButton("📄  Upload JSON (components list)")
+        b_json.setFixedHeight(36)
+        b_json.setStyleSheet(
+            f"QPushButton{{background:{BG_CARD};color:{AMBER};border:1px solid {AMBER}66;border-radius:6px;font-size:11px;font-weight:bold;text-align:left;padding-left:14px;}}"
+            f"QPushButton:hover{{background:{AMBER}22;border-color:{AMBER};}}"
+        )
+        b_json.clicked.connect(lambda: self._select("json"))
+        lay.addWidget(b_json)
+        
+        # 3. Take Latest Frame (live camera)
+        b_frame = QPushButton("📷  Take Latest Frame (live camera)")
+        b_frame.setFixedHeight(36)
+        if camera_active:
+            b_frame.setStyleSheet(
+                f"QPushButton{{background:{BG_CARD};color:{GREEN};border:1px solid {GREEN}66;border-radius:6px;font-size:11px;font-weight:bold;text-align:left;padding-left:14px;}}"
+                f"QPushButton:hover{{background:{GREEN}22;border-color:{GREEN};}}"
+            )
+            b_frame.setEnabled(True)
+        else:
+            b_frame.setStyleSheet(
+                f"QPushButton{{background:{BG_CARD};color:{TEXT_DIM};border:1px solid {BG_BORDER};border-radius:6px;font-size:11px;font-weight:bold;text-align:left;padding-left:14px;}}"
+            )
+            b_frame.setToolTip("Start the live camera inspection first to use this option")
+            b_frame.setEnabled(False)
+        b_frame.clicked.connect(lambda: self._select("frame"))
+        lay.addWidget(b_frame)
+        
+        lay.addSpacing(6)
+        
+        # Cancel Button
+        bbox = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        bbox.rejected.connect(self.reject)
+        bbox.setStyleSheet("QDialogButtonBox { border: none; }")
+        lay.addWidget(bbox)
+        
+    def _select(self, val):
+        self.choice = val
+        self.accept()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 1 — RUN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2281,26 +2369,16 @@ class RunTab(QWidget):
             f"#btn_master:hover{{background:{AMBER_DIM};border-color:{AMBER};}}"
         )
         self.btn_master.clicked.connect(self._upload_master)
-        self.btn_golden_img=QPushButton("📷  SAVE REF"); self.btn_golden_img.setObjectName("btn_gimg")
-        self.btn_golden_img.setFixedHeight(48)
-        self.btn_golden_img.setToolTip("Save current camera frame as golden reference image for diff-based AOI\n"
-                                        "Saved as golden_board.jpg in the project folder")
-        self.btn_golden_img.setStyleSheet(
-            f"#btn_gimg{{background:{BG_CARD2};color:{PURPLE};border:1px solid {PURPLE}44;"
-            f"border-radius:8px;font-size:10px;letter-spacing:1px;}}"
-            f"#btn_gimg:hover{{border-color:{PURPLE}99;color:{PURPLE};}}"
-        )
-        self.btn_golden_img.clicked.connect(self._save_golden_img)
         self.btn_flag=QPushButton("⚑  FLAG"); self.btn_flag.setFixedHeight(48)
         self.btn_flag.setStyleSheet(
             f"QPushButton{{background:{BG_CARD2};color:{TEXT_SEC};border:1px solid {BG_BORDER2};border-radius:8px;font-size:11px;}}"
             f"QPushButton:hover{{color:{RED};border-color:{RED_DIM};}}"
         )
         self.btn_flag.clicked.connect(self._flag)
-        br.addWidget(self.btn_start,2); br.addWidget(self.btn_master,1); br.addWidget(self.btn_golden_img); br.addWidget(self.btn_flag)
+        br.addWidget(self.btn_start,2); br.addWidget(self.btn_master,1.5); br.addWidget(self.btn_flag)
         L.addLayout(br)
         pf=make_card("pipe_bar"); pf.setFixedHeight(48); pl=QHBoxLayout(pf); pl.setContentsMargins(14,6,14,6)
-        self._pipe_lbl=QLabel("No pipeline deployed"); self._pipe_lbl.setObjectName("plbl")
+        self._pipe_lbl=QLabel("Filters: None"); self._pipe_lbl.setObjectName("plbl")
         self._pipe_lbl.setStyleSheet(f"#plbl{{color:{TEXT_SEC};font-size:11px;font-family:Consolas;border:none;}}")
         pl.addWidget(self._pipe_lbl,1)
         self.btn_inspect=QPushButton("INSPECT NOW"); self.btn_inspect.setObjectName("btn_insp")
@@ -2418,7 +2496,11 @@ class RunTab(QWidget):
         if model_path and os.path.exists(model_path) and HAS_YOLO:
             try: self._pipe_model=_YOLO(model_path)
             except: pass
-        self._pipe_lbl.setText(f"Pipeline: {len(filters)} filters")
+        if self._cam:
+            self._cam.set_filters(filters)
+        if self._ai:
+            self._ai.set_filters(filters)
+        self._pipe_lbl.setText(f"Filters: {len(filters)} active" if filters else "Filters: None")
         self._pipe_lbl.setStyleSheet(f"#plbl{{color:{CYAN};font-size:11px;font-family:Consolas;border:none;}}")
         self._update_inspect_btn()
 
@@ -2428,7 +2510,7 @@ class RunTab(QWidget):
         self.btn_inspect.setEnabled(enabled)
         if enabled:
             self.btn_inspect.setToolTip("Run a single AOI check on the current frame"
-                                        + (" (pipeline active)" if self._pipe_active else " (golden diff mode)"))
+                                        + (" (filters active)" if self._pipe_active else " (golden diff mode)"))
         else:
             self.btn_inspect.setToolTip("Start camera first")
 
@@ -2442,7 +2524,7 @@ class RunTab(QWidget):
         # Apply filter pipeline
         filtered = apply_filters(frame, self._pipe_filters)
 
-        all_ok = True; roi_disp = []
+        all_ok = True
 
         thresh = self._conf.value() / 100
 
@@ -2628,31 +2710,7 @@ class RunTab(QWidget):
             "PASS" if all_ok else "FAIL", missing_names, defects_aoi, _golden_img,
             db_row_id=_db_row_id)
 
-    def _save_golden_img(self):
-        """Save the current camera frame as the golden reference image for diff-based AOI."""
-        frame = self._cam.get_small_bgr() if self._cam else None
-        if frame is None:
-            QMessageBox.warning(self,"No Frame","Start the camera first, then save the reference frame.")
-            return
-        if not self._cfg._path:
-            QMessageBox.warning(self,"No Project","Load a project first.")
-            return
-        # Apply the active filter pipeline so the saved golden already matches
-        # what every future test frame will look like after pre-processing.
-        if self._pipe_filters:
-            frame = apply_filters(frame.copy(), self._pipe_filters)
-        path = os.path.join(self._cfg._path, "golden_board.jpg")
-        if HAS_CV2:
-            cv2.imwrite(path, frame)
-            self._log.append(f"[REF] Golden reference image saved → {os.path.basename(path)}")
-            self._log.append(f"[REF] Resolution: {frame.shape[1]}×{frame.shape[0]}")
-            # Invalidate cached calibration AND cached golden BGR
-            self._live_pos_tol = _MIN_POS_TOL
-            self._live_per_thr = {}
-            self._golden_bgr_cache = None; self._golden_img_cached_path = ""
-            ToastManager.show(self.window(), "Golden reference image saved — diff AOI active", "success")
-        else:
-            self._log.append("[REF] OpenCV not available")
+
 
     def _calibrate_live(self, golden_bgr, golden_dets, model):
         """Background calibration for live diff AOI — runs once after golden image saved."""
@@ -3012,43 +3070,113 @@ class RunTab(QWidget):
 
 
     def _upload_master(self):
-        """Upload a golden master: image auto-detected via YOLO, or load existing JSON."""
-        if not self._running:
-            # Not live — offer to load existing JSON or auto-detect from image
-            choice=QMessageBox.question(self,"Upload Master",
-                "Load from image (auto-detect components)?\n\nYes = pick image  |  No = pick JSON",
-                QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No|QMessageBox.StandardButton.Cancel)
-            if choice==QMessageBox.StandardButton.Yes:
-                p,_=QFileDialog.getOpenFileName(self,"Golden Board Image","","Images (*.jpg *.png *.jpeg *.bmp)")
-                if not p: return
-                self._log.append(f"[Master] Detecting components in {os.path.basename(p)}…")
-                if not HAS_YOLO or not HAS_CV2:
-                    self._log.append("[Master] Need OpenCV+ultralytics to auto-detect"); return
-                mp=self._cfg.get("model_path")
-                if not mp or not os.path.exists(mp):
-                    self._log.append("[Master] No model loaded – check FILTERS tab"); return
-                try:
-                    model=_YOLO(mp); img=cv2.imread(p); h,w=img.shape[:2]
-                    res=model.predict(img,conf=self._conf.value()/100,imgsz=640,verbose=False)[0]
-                    dets=[{"class":int(b.cls[0]),"name":model.names[int(b.cls[0])],
-                           "xyxy":list(map(int,b.xyxy[0]))} for b in res.boxes]
-                    if not dets: self._log.append("[Master] No components detected"); return
-                    path=os.path.join(self._cfg._path or ".","golden_master.json")
-                    with open(path,"w") as f: json.dump(dets,f,indent=2)
-                    self.load_golden(path); self.banner.set_pass()
-                    self._log.append(f"[Master] Saved {len(dets)} components from image")
-                except Exception as e:
-                    self._log.append(f"[Master] Error: {e}")
-            elif choice==QMessageBox.StandardButton.No:
-                self._load_golden_dlg()
-        else:
-            # Live — snapshot current detections
-            if not self._latest_dets: self._log.append("[!] No detections to save."); return
-            path=os.path.join(self._cfg._path or ".","golden_master.json")
-            with open(path,"w") as f:
-                json.dump([{"class":d["class"],"name":d["name"],"xyxy":d["xyxy"]} for d in self._latest_dets],f,indent=2)
-            self.load_golden(path); self.banner.set_pass()
-            self._log.append(f"[Master] Saved {len(self._latest_dets)} components from live camera")
+        """Upload a golden master: Choose disk picture, load JSON, or take latest frame from live camera."""
+        if not self._cfg._path:
+            QMessageBox.warning(self, "No Project", "Please load or create a project first.")
+            return
+            
+        dlg = MasterUploadDialog(camera_active=self._running, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+            
+        choice = dlg.choice
+        if choice == "picture":
+            p,_=QFileDialog.getOpenFileName(self,"Golden Board Image","","Images (*.jpg *.png *.jpeg *.bmp)")
+            if not p: return
+            self._log.append(f"[Master] Loading reference image from disk: {os.path.basename(p)}…")
+            
+            # Copy to project folder as golden_board.jpg so diff-based AOI works
+            dest = os.path.join(self._cfg._path or ".", "golden_board.jpg")
+            try:
+                shutil.copy(p, dest)
+                self._log.append(f"[Master] Saved reference image: {os.path.basename(dest)}")
+            except Exception as ce:
+                self._log.append(f"[Master] Image copy failed: {ce}")
+                
+            if not HAS_YOLO or not HAS_CV2:
+                self._log.append("[Master] Need OpenCV+ultralytics to auto-detect components"); return
+            mp=self._cfg.get("model_path")
+            if not mp or not os.path.exists(mp):
+                self._log.append("[Master] No model loaded – check Settings / FILTERS tab"); return
+            try:
+                model=_YOLO(mp, task="detect"); img=cv2.imread(dest); h,w=img.shape[:2]
+                res=model.predict(img,conf=self._conf.value()/100,imgsz=640,verbose=False)[0]
+                dets=[{"class":int(b.cls[0]),"name":model.names[int(b.cls[0])],
+                       "xyxy":list(map(int,b.xyxy[0]))} for b in res.boxes]
+                if not dets: 
+                    self._log.append("[Master] No components detected. Bounding boxes JSON not saved."); return
+                path=os.path.join(self._cfg._path or ".","golden_master.json")
+                with open(path,"w") as f: json.dump(dets,f,indent=2)
+                self.load_golden(path); self.banner.set_pass()
+                # Run background calibration
+                self._live_pos_tol = _MIN_POS_TOL
+                self._live_per_thr = {}
+                self._golden_bgr_cache = None; self._golden_img_cached_path = ""
+                self._calibrate_live(img, [
+                    _AOIComp(id=gi, label=g["name"], conf=1.0, 
+                             cx=((g["xyxy"][0]+g["xyxy"][2])/2)/w,
+                             cy=((g["xyxy"][1]+g["xyxy"][3])/2)/h,
+                             w=(g["xyxy"][2]-g["xyxy"][0])/w,
+                             h=(g["xyxy"][3]-g["xyxy"][1])/h)
+                    for gi, g in enumerate(dets)
+                ], model)
+                self._log.append(f"[Master] Successfully detected and saved {len(dets)} components from image")
+            except Exception as e:
+                self._log.append(f"[Master] Component detection error: {e}")
+                
+        elif choice == "json":
+            self._load_golden_dlg()
+            
+        elif choice == "frame":
+            # Live frame capture and component detection
+            frame = self._cam.get_small_bgr() if self._cam else None
+            if frame is None:
+                self._log.append("[!] Capture failed: No frame available from camera."); return
+            frame = frame.copy()
+            
+            # Apply active filters if any
+            if self._pipe_filters:
+                frame = apply_filters(frame.copy(), self._pipe_filters)
+                
+            dest = os.path.join(self._cfg._path or ".", "golden_board.jpg")
+            if not HAS_CV2:
+                self._log.append("[!] OpenCV not available."); return
+                
+            try:
+                cv2.imwrite(dest, frame)
+                self._log.append(f"[Master] Captured reference image frame saved → {os.path.basename(dest)}")
+            except Exception as ce:
+                self._log.append(f"[Master] Failed to save captured frame: {ce}")
+                return
+                
+            mp=self._cfg.get("model_path")
+            if not mp or not os.path.exists(mp):
+                self._log.append("[Master] No model loaded – check Settings / FILTERS tab"); return
+            try:
+                model=_YOLO(mp, task="detect"); h,w=frame.shape[:2]
+                res=model.predict(frame,conf=self._conf.value()/100,imgsz=640,verbose=False)[0]
+                dets=[{"class":int(b.cls[0]),"name":model.names[int(b.cls[0])],
+                       "xyxy":list(map(int,b.xyxy[0]))} for b in res.boxes]
+                if not dets:
+                    self._log.append("[Master] No components detected in current frame. Golden master JSON not saved."); return
+                path=os.path.join(self._cfg._path or ".","golden_master.json")
+                with open(path,"w") as f: json.dump(dets,f,indent=2)
+                self.load_golden(path); self.banner.set_pass()
+                # Run background calibration
+                self._live_pos_tol = _MIN_POS_TOL
+                self._live_per_thr = {}
+                self._golden_bgr_cache = None; self._golden_img_cached_path = ""
+                self._calibrate_live(frame, [
+                    _AOIComp(id=gi, label=g["name"], conf=1.0, 
+                             cx=((g["xyxy"][0]+g["xyxy"][2])/2)/w,
+                             cy=((g["xyxy"][1]+g["xyxy"][3])/2)/h,
+                             w=(g["xyxy"][2]-g["xyxy"][0])/w,
+                             h=(g["xyxy"][3]-g["xyxy"][1])/h)
+                    for gi, g in enumerate(dets)
+                ], model)
+                self._log.append(f"[Master] Successfully captured and detected {len(dets)} components from live frame")
+            except Exception as e:
+                self._log.append(f"[Master] Capture detection error: {e}")
 
     def _toggle(self):
         if not self._running: self._start()
@@ -3175,7 +3303,7 @@ class RunTab(QWidget):
         for k in self._persist: self._persist[k]=0
         self._c_total.set_value(0); self._c_pass.set_value(0); self._c_fail.set_value(0)
         self._ybar.setValue(0); self._ypct.setText("YIELD: -"); self._log.clear()
-        self.banner.reset(); self.video.set_roi_results([]); self._counter_dirty=False
+        self.banner.reset(); self._counter_dirty=False
         self._result_strip.clear_results(); self._result_times.clear()
         self._throughput_lbl.setText("— boards/min")
 
@@ -3197,7 +3325,7 @@ class RunTab(QWidget):
         self.video.clear()
         self.banner.reset()
         self._clear_history()
-        self._pipe_lbl.setText("No pipeline deployed")
+        self._pipe_lbl.setText("Filters: None")
         self._pipe_lbl.setStyleSheet(f"#plbl{{color:{TEXT_SEC};font-size:11px;font-family:Consolas;border:none;}}")
         self._update_inspect_btn()
         # Update project label
@@ -7944,11 +8072,39 @@ class SettingsDialog(QDialog):
         form.addStretch()
         scroll.setWidget(inner); lay.addWidget(scroll, 1)
 
+        from PySide6.QtWidgets import QMessageBox
+        
+        btn_row = QHBoxLayout()
+        reset_btn = QPushButton("Reset to Defaults")
+        reset_btn.setStyleSheet(f"color:red; border:1px solid #660000; border-radius:4px; padding:4px 8px;")
+        def _reset_defaults():
+            if QMessageBox.question(self, "Reset Settings", "Reset all settings to default values?") == QMessageBox.StandardButton.Yes:
+                self._cam_idx.setValue(0)
+                self._conf.setValue(0.25)
+                self._autolbl_conf.setValue(0.50)
+                self._aoi_conf.setValue(0.25)
+                self._iou.setValue(0.30)
+                self._persist.setValue(5)
+                self._max_w.setValue(0.30)
+                self._max_h.setValue(0.30)
+                self._edge.setValue(10)
+                self._aoi_cal.setValue(8)
+                self._autosave_cb.setChecked(True)
+                self._log_history_cb.setChecked(True)
+                self._save_annot_cb.setChecked(True)
+                self._pcb_desat.setValue(0.70)
+                self._pcb_boost.setValue(1.30)
+        reset_btn.clicked.connect(_reset_defaults)
+        
         bbox = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                 QDialogButtonBox.StandardButton.Cancel)
         bbox.accepted.connect(self._accept)
         bbox.rejected.connect(self.reject)
-        lay.addWidget(bbox)
+        
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(bbox)
+        lay.addLayout(btn_row)
 
     def _accept(self):
         c = self._cfg
